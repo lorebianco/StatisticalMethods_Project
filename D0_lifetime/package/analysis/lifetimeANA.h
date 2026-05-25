@@ -184,9 +184,19 @@ class lifetimeANA
     virtual Bool_t Notify();
     virtual void Show(Long64_t entry = -1);
 
-    void Resolution(Int_t nGauss, Bool_t useSharedMean, Bool_t saveGraphs = false);
-    void Resolution2D(Bool_t saveGraphs = false);
-    void ConvolvedFit(Bool_t saveGraphs = false);
+    void Resolution(Int_t nGauss, Bool_t useSharedMean);
+    void Resolution2D();
+    void ConvolvedFit(Bool_t useAcceptance = true);
+    void Acceptance(UInt_t seed = 0);
+    void AcceptanceWeight(Float_t life, UInt_t seed = 0);
+    void AcceptanceScan(
+        Float_t tauFactMin, Float_t tauFactMax, Float_t tauStep = 0.5, UInt_t seed = 0);
+    void CalibrateTimeBias();
+
+    // Pipeline
+    std::vector<double> FitResolutionNormalized();
+    std::vector<double> FitAcceptanceNormalized(UInt_t seed = 0);
+    void RunGlobalFit();
 };
 
 #endif
