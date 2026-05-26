@@ -193,10 +193,14 @@ class lifetimeANA
         Float_t tauFactMin, Float_t tauFactMax, Float_t tauStep = 0.5, UInt_t seed = 0);
     void CalibrateTimeBias();
 
-    // Pipeline
+    // Signal-Only Pipeline
     std::vector<double> FitResolutionNormalized();
     std::vector<double> FitAcceptanceNormalized(UInt_t seed = 0);
     void RunGlobalFit();
+    void RunManualUnbinnedFit();
+
+    // Background
+    void MassRegions();
 };
 
 #endif
