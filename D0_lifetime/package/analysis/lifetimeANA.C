@@ -3256,7 +3256,7 @@ void lifetimeANA::FitMassMC()
 
     // 4. Definizione della funzione di Fit (Doppia Gaussiana)
     // Usiamo 'f_2G_Frac' definita all'inizio del tuo file che accetta 6 parametri
-    TF1 *fFitMass = new TF1("fFitMass", f_2G_Shared, 1.8, 1.95, 5);
+    TF1 *fFitMass = new TF1("fFitMass", f_2G_Shared, 1.815, 1.92, 5);
 
     // Stime iniziali automatiche per i parametri basate sull'istogramma
     Double_t meanInit  = hMassMC->GetBinCenter(hMassMC->GetMaximumBin()); // Picco massimo
@@ -3272,15 +3272,7 @@ void lifetimeANA::FitMassMC()
     // par[4] = Sigma 2
     // par[5] = Frazione della prima gaussiana
     fFitMass->SetParameters(meanInit, yieldInit * 0.7, rmsInit * 0.5, yieldInit * 0.3, rmsInit * 1.5);
-        fFitMass->SetParNames("Shared_Mean", "Yield_1", "Sigma_1", "Yield_2", "Sigma_2");
-
-    // Limiti di sicurezza per aiutare Minuit a convergere
-//    fFitMass->SetParLimits(0, 0, yieldInit * 2);
-//    fFitMass->SetParLimits(1, 1.8, 1.95);
-//    fFitMass->SetParLimits(2, 0.001, 0.05); // Sigma tipiche per picchi di massa D/B
-//    fFitMass->SetParLimits(3, 1.8, 1.95);
-//    fFitMass->SetParLimits(4, 0.001, 0.08);
-//    fFitMass->SetParLimits(5, 0.0, 1.0); // La frazione deve essere compresa tra 0 e 1
+        fFitMass->SetParNames("Shared_Mean", "Yield_{1}", "#sigma_{1}", "Yield_{2}", "#sigma_{2}");
 
     // 6. Disegno dei risultati
     TCanvas *cMass = new TCanvas("cMass", "Mass Fit MC", 800, 600);
@@ -3295,13 +3287,13 @@ void lifetimeANA::FitMassMC()
     fFitMass->Draw("SAME");
 
     // Opzionale: Disegna separatamente le due componenti gaussiane per controllo visivo
-    TF1 *g1 = new TF1("g1", "gaus", 1.8, 1.95);
+    TF1 *g1 = new TF1("g1", "gaus", 1.815, 1.92);
         g1->SetParameters(fFitMass->GetParameter(1), fFitMass->GetParameter(0), fFitMass->GetParameter(2));
         g1->SetLineColor(kGreen+2);
         g1->SetLineStyle(2);
         g1->Draw("SAME");
 
-        TF1 *g2 = new TF1("g2", "gaus", 1.8, 1.95);
+        TF1 *g2 = new TF1("g2", "gaus", 1.815, 1.92);
         g2->SetParameters(fFitMass->GetParameter(3), fFitMass->GetParameter(0), fFitMass->GetParameter(4));
         g2->SetLineColor(kBlue);
         g2->SetLineStyle(2);
@@ -3309,4 +3301,116 @@ void lifetimeANA::FitMassMC()
 
     cMass->SaveAs("fit_mass_mc.pdf");
     cMass->SaveAs("fit_mass_mc.root");
+}
+
+void lifetimeANA::FitMassData()
+{
+    SetLBStyle();
+
+        // 1. Configurazione dello stile globale di ROOT
+        gStyle->SetOptStat(1110);
+        gStyle->SetOptFit(1111);
+
+        // 2. Definizione dell'istogramma per i Dati (Stesso binning e range del MC)
+        TH1D *hMassData = new TH1D("hMassData", "Fit Massa M0Kpi (Dati);M(K#pi) [GeV];Entries", 100, 1.8, 1.95);
+        hMassData->Sumw2();
+
+        if (fChain == 0) return;
+        Long64_t nentries = fChain->GetEntriesFast();
+
+        // 3. Loop sugli eventi del TTree per riempire i Dati (id == 1)
+        for (Long64_t jentry = 0; jentry < nentries; jentry++) {
+            if (LoadTree(jentry) < 0) break;
+            fChain->GetEntry(jentry);
+
+            // Seleziona solo i Dati reali (id == 1)
+            if (id == 1) {
+                hMassData->Fill(M0_MKpi);
+            }
+        }
+
+        if (hMassData->GetEntries() == 0) {
+            cout << "Errore: Nessun evento trovato con id == 1!" << endl;
+            return;
+        }
+
+        // 4. Definizione della funzione di Fit Totale: Segnale (f_2G_Shared) + Fondo (pol1)
+        // f_2G_Shared ha 5 parametri (indici 0-4). pol1 aggiunge altri 2 parametri (indici 5-6).
+        // Totale parametri = 7. Range ristretto per il fit come hai fatto sul MC.
+        TF1 *fFitTot = new TF1("fFitTot",
+                               [&](Double_t *x, Double_t *par) {
+                                   return f_2G_Shared(x, par) + par[5] + par[6]*x[0];
+                               }, 1.80, 1.95, 7);
+
+        /* NOTA: Se volessi un polinomio di secondo grado (pol2), ti basterebbe:
+           - Cambiare il numero totale di parametri da 7 a 8
+           - Modificare la lambda function aggiungendo "+ par[7]*x[0]*x[0]"
+        */
+
+        // 5. Stime iniziali basate sull'istogramma dei Dati
+        Double_t meanInit  = hMassData->GetBinCenter(hMassData->GetMaximumBin());
+        Double_t rmsInit   = hMassData->GetRMS();
+        Double_t binWidth  = hMassData->GetBinWidth(1);
+        Double_t totalEnt  = hMassData->Integral();
+        Double_t yieldInit = totalEnt * binWidth;
+
+        // Assegnazione dei parametri iniziali:
+        // [0] Shared_Mean, [1] Yield_1, [2] Sigma_1, [3] Yield_2, [4] Sigma_2
+        fFitTot->SetParameter(0, meanInit);
+        fFitTot->SetParameter(1, yieldInit * 0.4); // Ipotizziamo il 40% di segnale nella prima gaus
+        fFitTot->SetParameter(2, rmsInit * 0.4);
+        fFitTot->SetParameter(3, yieldInit * 0.2); // Ipotizziamo il 20% nella seconda gaus
+        fFitTot->SetParameter(4, rmsInit * 1.2);
+        
+        // Parametri del fondo (pol1: par[5] è l'intercetta, par[6] è la pendenza)
+        // Una stima iniziale piatta sul valore medio del fondo ai bordi dell'istogramma:
+        Double_t bkgEstimatePerBin = hMassData->GetBinContent(1); // altezza del primo bin come stima del fondo
+        fFitTot->SetParameter(5, bkgEstimatePerBin);
+        fFitTot->SetParameter(6, 0.0); // pendenza iniziale piatta
+
+        // Nomi dei parametri per il box dei risultati grafico
+        fFitTot->SetParNames("Shared_Mean", "Yield_{1}", "#sigma_{1}", "Yield_{2}", "#sigma_{2}", "Bkg_Inter", "Bkg_Slope");
+
+        // Limiti opzionali per evitare che il fit inverta le componenti o diverga
+        fFitTot->SetParLimits(0, 1.84, 1.88); // La massa del D0 è intorno a 1.864 GeV
+        fFitTot->SetParLimits(2, 0.002, 0.02);
+        fFitTot->SetParLimits(4, 0.01, 0.06);
+
+        // 6. Preparazione Canvas ed esecuzione del Fit
+        TCanvas *cMassData = new TCanvas("cMassData", "Mass Fit Data", 800, 600);
+        cMassData->cd();
+
+        cout << "\n--- Fitting Mass for Data (id==1) ---" << endl;
+        hMassData->Fit(fFitTot, "L I R");
+
+        // 7. Disegno delle componenti separate per controllo visivo
+        hMassData->Draw("E");
+        fFitTot->SetLineWidth(2);
+        fFitTot->Draw("SAME");
+
+        // Componente Segnale 1 (Gaussiana 1)
+        TF1 *g1 = new TF1("g1", "gaus", 1.80, 1.95);
+        g1->SetParameters(fFitTot->GetParameter(1), fFitTot->GetParameter(0), fFitTot->GetParameter(2));
+        g1->SetLineColor(kGreen+2);
+        g1->SetLineStyle(2);
+        g1->Draw("SAME");
+
+        // Componente Segnale 2 (Gaussiana 2)
+        TF1 *g2 = new TF1("g2", "gaus", 1.80, 1.95);
+        g2->SetParameters(fFitTot->GetParameter(3), fFitTot->GetParameter(0), fFitTot->GetParameter(4));
+        g2->SetLineColor(kBlue);
+        g2->SetLineStyle(2);
+        g2->Draw("SAME");
+
+        // Componente di Fondo (Polinomio)
+        TF1 *fBkg = new TF1("fBkg", "pol1", 1.80, 1.95);
+        fBkg->SetParameters(fFitTot->GetParameter(5), fFitTot->GetParameter(6));
+        fBkg->SetLineColor(kMagenta+1);
+        fBkg->SetLineStyle(7); // Tratteggio differente
+        fBkg->SetLineWidth(2);
+        fBkg->Draw("SAME");
+
+        // 8. Salvataggio risultati
+        cMassData->SaveAs("fit_mass_data.pdf");
+        cMassData->SaveAs("fit_mass_data.root");
 }

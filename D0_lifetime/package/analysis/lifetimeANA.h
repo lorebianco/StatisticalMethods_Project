@@ -240,6 +240,7 @@ class lifetimeANA
     AuxFitResult MassRegions();
     // Background studies
     void FitMassMC();
+    void FitMassData();
 };
 
 #endif
