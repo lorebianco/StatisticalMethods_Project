@@ -72,7 +72,7 @@ Double_t f_3G_Indep(Double_t *x, Double_t *par)
         + par[7] * exp(-0.5 * pow((x[0] - par[6]) / par[8], 2));
 }
 
-Double_t f_Bkg_Sides(Double_t *x, Double_t *par)
+Double_t f_Bkg_Sides_mass(Double_t *x, Double_t *par)
 {
     Double_t xx = x[0];
     Double_t min = par[2]; // Limite inferiore della regione di segnale
@@ -89,6 +89,19 @@ Double_t f_Bkg_Sides(Double_t *x, Double_t *par)
     Double_t tau = par[1];
 
     return A * TMath::Exp(-xx / tau);
+}
+
+Double_t fBkg_Sides_time(Double_t *x, Double_t *par)
+{
+    Double_t t = x[0];
+    Double_t mu = par[0];
+    Double_t A = par[1];
+    Double_t sigma = par[2];
+    Double_t alpha = par[3];
+    Double_t N = par[4];
+
+    // TMath:: aggiunto, e il meno è FUORI da TMath::Power
+    return N * TMath::Erf(((t - mu) / A)) * TMath::Exp(-TMath::Power((t) / sigma, alpha));
 }
 
 class ExpoMultiGaussConv
@@ -1923,11 +1936,11 @@ void lifetimeANA::MassRegions()
     Double_t minSig = hMass_MC->GetBinCenter(binMin);
     Double_t maxSig = hMass_MC->GetBinCenter(binMax);
 
-    // 1. Definiamo gli istogrammi in UNITÀ NORMALIZZATE (t / tau_MC) con range [0, 10]
-    auto hTime_left
-        = new TH1D("hTime_left", "Time (Left Sideband);t / #tau_{MC};Events", 100, 0, 10);
-    auto hTime_right
-        = new TH1D("hTime_right", "Time (Right Sideband);t / #tau_{MC};Events", 100, 0, 10);
+    // Time histograms
+    auto hTime_left = new TH1D("hTime_left", "Time (Left Sideband);t [ps];Events", 100, 0, 10);
+    auto hTime_right = new TH1D("hTime_right", "Time (Right Sideband);t [ps];Events", 100, 0, 10);
+    AddBinSizeOnYTitle(hTime_left, "ps");
+    AddBinSizeOnYTitle(hTime_right, "ps");
     hTime_left->Sumw2();
     hTime_right->Sumw2();
 
@@ -1939,75 +1952,29 @@ void lifetimeANA::MassRegions()
         if(id == 1) // Data
         {
             if(M0_MKpi < minSig)
-                hTime_left->Fill(M0_time / MC_LIFE); // <-- NORMALIZZATO!
+                hTime_left->Fill(M0_time * 1e12);
             else if(M0_MKpi > maxSig)
-                hTime_right->Fill(M0_time / MC_LIFE); // <-- NORMALIZZATO!
+                hTime_right->Fill(M0_time * 1e12);
         }
     }
 
-    // 2. Recuperiamo i parametri di Risoluzione e Accettanza dal MC
-    // (Nota: questo invocherà le funzioni e produrrà i loro plot, se vuoi evitarlo
-    // puoi hardcodare i numeri in un array std::vector<double> resPars = {...}; )
-    std::cout << "\n--- Estrazione parametri per il modello di fondo ---" << std::endl;
-    std::vector<double> resPars = FitResolutionNormalized();
-    std::vector<double> accPars = FitAcceptanceNormalized(42);
-
-    // 3. Creiamo il Modello
-    Int_t nGaus = 2;
-    Bool_t useAcceptance = true;
-    FullPDF_ConvAcc fModel(nGaus, useAcceptance);
-
-    Double_t minT = 0.8; // Scegli il range appropriato
+    Double_t minT = 0.15; // Scegli il range appropriato
     Double_t maxT = 10.0;
 
-    auto fFitLeft = new TF1("fFitLeft", fModel, minT, maxT, fModel.GetNPar());
-    auto fFitRight = new TF1("fFitRight", fModel, minT, maxT, fModel.GetNPar());
+    auto fFitLeft = new TF1("fFitLeft", fBkg_Sides_time, minT, maxT, 5);
+    auto fFitRight = new TF1("fFitRight", fBkg_Sides_time, minT, maxT, 5);
     fFitLeft->SetNpx(1000);
     fFitRight->SetNpx(1000);
 
-    // Funzione Lambda (helper) per fissare i parametri velocemente su entrambi i fit
-    auto SetupBackgroundFit = [&](TF1 *fFit, TH1D *h)
-    {
-        // Parametri liberi
-        fFit->SetParameter(0, 1.0); // Tau del fondo (inizializzato a 1.0 tau_MC, ma è libero!)
-        fFit->SetParName(0, "Tau_Bkg");
-        fFit->SetParameter(3, h->Integral() * h->GetBinWidth(1)); // Yield
-        fFit->SetParName(3, "Yield");
-
-        // Parametri fissati dalla Risoluzione
-        fFit->FixParameter(1, resPars[0]);
-        fFit->SetParName(1, "Res_Mu1");
-        fFit->FixParameter(2, resPars[2]);
-        fFit->SetParName(2, "Res_Mu2");
-        fFit->FixParameter(4, resPars[1]);
-        fFit->SetParName(4, "Res_Sig1");
-        fFit->FixParameter(5, resPars[3]);
-        fFit->SetParName(5, "Res_Sig2");
-        fFit->FixParameter(6, resPars[4]);
-        fFit->SetParName(6, "Res_Frac1");
-
-        // Parametri fissati dall'Accettanza
-        fFit->FixParameter(7, accPars[0]);
-        fFit->SetParName(7, "Acc_Frac");
-        fFit->FixParameter(8, accPars[1]);
-        fFit->SetParName(8, "Acc_Mu1");
-        fFit->FixParameter(9, accPars[2]);
-        fFit->SetParName(9, "Acc_Sig1");
-        fFit->FixParameter(10, accPars[3]);
-        fFit->SetParName(10, "Acc_Mu2");
-        fFit->FixParameter(11, accPars[4]);
-        fFit->SetParName(11, "Acc_Sig2");
-    };
-
-    SetupBackgroundFit(fFitLeft, hTime_left);
-    SetupBackgroundFit(fFitRight, hTime_right);
+    fFitLeft->SetParameters(0.17, 0.28, 1.46, 0.97, 1940);
+    fFitRight->SetParameters(0.17, 0.28, 1.46, 0.97, 1940);
 
     // 4. Fit!
     std::cout << "\n--- Fitting Left Sideband ---" << std::endl;
-    hTime_left->Fit(fFitLeft, "L I R");
+    hTime_left->Fit(fFitLeft, "L I R 0");
 
     std::cout << "\n--- Fitting Right Sideband ---" << std::endl;
-    hTime_right->Fit(fFitRight, "L I R");
+    hTime_right->Fit(fFitRight, "L I R 0");
 
     // ==============================================================================
     // 5. Plotting
@@ -2024,7 +1991,6 @@ void lifetimeANA::MassRegions()
     hTime_left->SetMarkerColor(kGreen + 2);
     hTime_left->SetMinimum(0.5);
 
-    fFitLeft->SetLineColor(kBlack);
     fFitLeft->SetLineWidth(2);
 
     hTime_left->Draw("E");
@@ -2040,7 +2006,6 @@ void lifetimeANA::MassRegions()
     hTime_right->SetMarkerColor(kMagenta + 2);
     hTime_right->SetMinimum(0.5);
 
-    fFitRight->SetLineColor(kBlack);
     fFitRight->SetLineWidth(2);
 
     hTime_right->Draw("E");

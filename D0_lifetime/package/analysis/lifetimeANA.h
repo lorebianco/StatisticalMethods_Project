@@ -196,6 +196,8 @@ class lifetimeANA
     // Signal-Only Pipeline
     std::vector<double> FitResolutionNormalized();
     std::vector<double> FitAcceptanceNormalized(UInt_t seed = 0);
+    std::vector<double> FitResolutionPs();
+    std::vector<double> FitAcceptancePs(UInt_t seed = 0);
     void RunGlobalFit();
     void RunManualUnbinnedFit();
 
