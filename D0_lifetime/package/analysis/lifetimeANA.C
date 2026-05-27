@@ -32,7 +32,7 @@ using namespace TMath;
 using namespace lbStyle;
 
 constexpr Double_t MC_LIFE = 410.3e-15; // s
-constexpr Bool_t savePlots = false;
+constexpr Bool_t savePlots = true;
 constexpr Double_t TIME_CUT = 1; // Taglio minimo su t/tau_MC
 
 // --- FUNZIONI DI FIT ---
@@ -3220,4 +3220,93 @@ void lifetimeANA::RunDataFitProfiled()
         c_data->SaveAs("plot_7_DataFit_Profiled_Pulls.pdf");
 
     delete minuit;
+}
+
+void lifetimeANA::FitMassMC()
+{
+    SetLBStyle();
+
+    // 1. Configurazione dello stile globale di ROOT
+    gStyle->SetOptStat(1110);
+    gStyle->SetOptFit(1111);
+
+    // 2. Definizione dell'istogramma (Range coerente con Loop(): 1.8 - 1.95 GeV)
+    TH1D *hMassMC = new TH1D("hMassMC", "Fit Massa M0Kpi (MC);M(K#pi) [GeV];Entries", 100, 1.8, 1.95);
+    hMassMC->Sumw2();
+
+    if (fChain == 0) return;
+    Long64_t nentries = fChain->GetEntriesFast();
+
+    // 3. Loop sugli eventi del TTree per riempire l'istogramma
+    for (Long64_t jentry = 0; jentry < nentries; jentry++) {
+        if (LoadTree(jentry) < 0) break;
+        fChain->GetEntry(jentry);
+
+        // Seleziona solo il MC (id == 13)
+        if (id == 13) {
+            hMassMC->Fill(M0_MKpi);
+        }
+    }
+
+    // Controlla se ci sono abbastanza eventi
+    if (hMassMC->GetEntries() == 0) {
+        cout << "Errore: Nessun evento trovato con id == 13!" << endl;
+        return;
+    }
+
+    // 4. Definizione della funzione di Fit (Doppia Gaussiana)
+    // Usiamo 'f_2G_Frac' definita all'inizio del tuo file che accetta 6 parametri
+    TF1 *fFitMass = new TF1("fFitMass", f_2G_Shared, 1.8, 1.95, 5);
+
+    // Stime iniziali automatiche per i parametri basate sull'istogramma
+    Double_t meanInit  = hMassMC->GetBinCenter(hMassMC->GetMaximumBin()); // Picco massimo
+    Double_t rmsInit   = hMassMC->GetRMS();
+    Double_t binWidth  = hMassMC->GetBinWidth(1);
+    Double_t yieldInit = hMassMC->GetEntries() * binWidth; // Area totale approssimata
+
+    // Mapping dei parametri di f_2G_Frac:
+    // par[0] = Yield totale (Eventi * bin width)
+    // par[1] = Media 1
+    // par[2] = Sigma 1
+    // par[3] = Media 2
+    // par[4] = Sigma 2
+    // par[5] = Frazione della prima gaussiana
+    fFitMass->SetParameters(meanInit, yieldInit * 0.7, rmsInit * 0.5, yieldInit * 0.3, rmsInit * 1.5);
+        fFitMass->SetParNames("Shared_Mean", "Yield_1", "Sigma_1", "Yield_2", "Sigma_2");
+
+    // Limiti di sicurezza per aiutare Minuit a convergere
+//    fFitMass->SetParLimits(0, 0, yieldInit * 2);
+//    fFitMass->SetParLimits(1, 1.8, 1.95);
+//    fFitMass->SetParLimits(2, 0.001, 0.05); // Sigma tipiche per picchi di massa D/B
+//    fFitMass->SetParLimits(3, 1.8, 1.95);
+//    fFitMass->SetParLimits(4, 0.001, 0.08);
+//    fFitMass->SetParLimits(5, 0.0, 1.0); // La frazione deve essere compresa tra 0 e 1
+
+    // 6. Disegno dei risultati
+    TCanvas *cMass = new TCanvas("cMass", "Mass Fit MC", 800, 600);
+    cMass->cd();
+    
+    // 5. Esecuzione del Fit
+    cout << "\n--- Fitting Mass for MC (id==13) ---" << endl;
+    hMassMC->Fit(fFitMass, "L I R");
+    
+    hMassMC->Draw("E");
+    fFitMass->SetLineWidth(2);
+    fFitMass->Draw("SAME");
+
+    // Opzionale: Disegna separatamente le due componenti gaussiane per controllo visivo
+    TF1 *g1 = new TF1("g1", "gaus", 1.8, 1.95);
+        g1->SetParameters(fFitMass->GetParameter(1), fFitMass->GetParameter(0), fFitMass->GetParameter(2));
+        g1->SetLineColor(kGreen+2);
+        g1->SetLineStyle(2);
+        g1->Draw("SAME");
+
+        TF1 *g2 = new TF1("g2", "gaus", 1.8, 1.95);
+        g2->SetParameters(fFitMass->GetParameter(3), fFitMass->GetParameter(0), fFitMass->GetParameter(4));
+        g2->SetLineColor(kBlue);
+        g2->SetLineStyle(2);
+        g2->Draw("SAME");
+
+    cMass->SaveAs("fit_mass_mc.pdf");
+    cMass->SaveAs("fit_mass_mc.root");
 }
