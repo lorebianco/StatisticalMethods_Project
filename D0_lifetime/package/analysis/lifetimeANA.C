@@ -3307,110 +3307,225 @@ void lifetimeANA::FitMassData()
 {
     SetLBStyle();
 
-        // 1. Configurazione dello stile globale di ROOT
-        gStyle->SetOptStat(1110);
-        gStyle->SetOptFit(1111);
+    // 1. Configurazione dello stile globale di ROOT
+    gStyle->SetOptStat(1110);
+    gStyle->SetOptFit(1111);
 
-        // 2. Definizione dell'istogramma per i Dati (Stesso binning e range del MC)
-        TH1D *hMassData = new TH1D("hMassData", "Fit Massa M0Kpi (Dati);M(K#pi) [GeV];Entries", 100, 1.8, 1.95);
-        hMassData->Sumw2();
+    // 2. Definizione dell'istogramma per i Dati
+    TH1D *hMassData = new TH1D("hMassData", "Fit Massa M0Kpi (Dati);M(K#pi) [GeV];Entries", 100, 1.8, 1.95);
+    hMassData->Sumw2();
 
-        if (fChain == 0) return;
-        Long64_t nentries = fChain->GetEntriesFast();
+    if (fChain == 0) return;
+    Long64_t nentries = fChain->GetEntriesFast();
 
-        // 3. Loop sugli eventi del TTree per riempire i Dati (id == 1)
-        for (Long64_t jentry = 0; jentry < nentries; jentry++) {
-            if (LoadTree(jentry) < 0) break;
-            fChain->GetEntry(jentry);
+    // 3. Loop sugli eventi del TTree (id == 1)
+    for (Long64_t jentry = 0; jentry < nentries; jentry++) {
+        if (LoadTree(jentry) < 0) break;
+        fChain->GetEntry(jentry);
+        if (id == 1) {
+            hMassData->Fill(M0_MKpi);
+        }
+    }
 
-            // Seleziona solo i Dati reali (id == 1)
-            if (id == 1) {
-                hMassData->Fill(M0_MKpi);
+    if (hMassData->GetEntries() == 0) {
+        cout << "Errore: Nessun evento trovato con id == 1!" << endl;
+        return;
+    }
+
+    Double_t binWidth = hMassData->GetBinWidth(1);
+    TString yAxisTitle = Form("Candidates / (%g GeV)", binWidth);
+    hMassData->GetYaxis()->SetTitle(yAxisTitle);
+    
+    // 4. Definizione della funzione di Fit Totale espressa tramite AREE (Yields)
+    // I parametri estratti saranno:
+    // par[0] = Shared_Mean
+    // par[1] = Area_G1 (Numero eventi nel primo picco)
+    // par[2] = Sigma_1
+    // par[3] = Area_G2 (Numero eventi nel secondo picco)
+    // par[4] = Sigma_2
+    // par[5] = Area_Bkg (Numero eventi totali di fondo nel range di fit)
+    // par[6] = Pendenza del fondo (normalizzata)
+    
+    TF1 *fFitTot = new TF1("fFitTot",
+        [&](Double_t *x, Double_t *par) {
+            Double_t xx = x[0];
+            
+            // Costante di normalizzazione della gaussiana standard: 1 / (sigma * sqrt(2*pi))
+            Double_t norm_g1 = 1.0 / (par[2] * Sqrt(2.0 * Pi()));
+            Double_t g1 = par[1] * norm_g1 * Exp(-0.5 * pow((xx - par[0]) / par[2], 2));
+            
+            Double_t norm_g2 = 1.0 / (par[4] * Sqrt(2.0 * Pi()));
+            Double_t g2 = par[3] * norm_g2 * Exp(-0.5 * pow((xx - par[0]) / par[4], 2));
+            
+            // Fondo (pol1) normalizzato nell'area del range di fit [1.80, 1.95]
+            // Un pol1 generico lineare normalizzato all'area ha la forma: Area * (1 + slope*(x - x_mid)) / (x_max - x_min)
+            Double_t x_min = 1.80;
+            Double_t x_max = 1.95;
+            Double_t x_mid = 0.5 * (x_max + x_min);
+            Double_t bkg = par[5] * (1.0 + par[6] * (xx - x_mid)) / (x_max - x_min);
+            
+            // Moltiplichiamo tutto per il binWidth perché stiamo fittando un istogramma (conteggi per bin)
+            return (g1 + g2 + bkg) * binWidth;
+        }, 1.80, 1.95, 7);
+
+    // 5. Stime iniziali basate sui conteggi effettivi dell'istogramma
+    Double_t meanInit  = hMassData->GetBinCenter(hMassData->GetMaximumBin());
+    Double_t rmsInit   = hMassData->GetRMS();
+    Double_t totalEvents = hMassData->Integral(); // Conteggio totale degli eventi nel plot
+
+    // Assegnazione dei parametri iniziali (in numero di eventi/aree)
+    fFitTot->SetParameter(0, meanInit);
+    fFitTot->SetParameter(1, totalEvents * 0.30); // Ipotizziamo il 30% di eventi in G1
+    fFitTot->SetParameter(2, rmsInit * 0.4);
+    fFitTot->SetParameter(3, totalEvents * 0.15); // Ipotizziamo il 15% di eventi in G2
+    fFitTot->SetParameter(4, rmsInit * 1.2);
+    fFitTot->SetParameter(5, totalEvents * 0.55); // Ipotizziamo il 55% di eventi come fondo
+    fFitTot->SetParameter(6, 0.0);                // Fondo inizialmente piatto (pendenza 0)
+
+    // Nomi espliciti dei parametri come richiesto
+    fFitTot->SetParNames("Shared_Mean", "Area_{G1}", "#sigma_{1}", "Area_{G2}", "#sigma_{2}", "Area_{bkg}", "Bkg_Slope");
+
+    // 6. Preparazione Canvas ed esecuzione del Fit
+    TCanvas *cMassData = new TCanvas("cMassData", "Mass Fit Data", 800, 600);
+    cMassData->cd();
+    fFitTot->SetNpx(1000);
+    
+    cout << "\n--- Fitting Mass for Data (id==1) ---" << endl;
+    // Usiamo l'opzione "S" per salvare il risultato del fit e calcolare le frazioni con gli errori correttamente
+    TFitResultPtr fitResult = hMassData->Fit(fFitTot, "L I R S");
+
+    // 7. Disegno del fit totale e delle componenti individuali
+    hMassData->Draw("E");
+    fFitTot->SetLineWidth(2);
+    fFitTot->Draw("SAME");
+
+    // Componente Segnale 1 (Usiamo "gausn" perché par[1] ora è l'Area!)
+    TF1 *g1 = new TF1("g1", "gausn", 1.80, 1.95);
+    g1->SetParameters(fFitTot->GetParameter(1) * binWidth, fFitTot->GetParameter(0), fFitTot->GetParameter(2));
+    g1->SetLineColor(kGreen+2);
+    g1->SetLineStyle(2);
+    g1->Draw("SAME");
+
+    // Componente Segnale 2
+    TF1 *g2 = new TF1("g2", "gausn", 1.80, 1.95);
+    g2->SetParameters(fFitTot->GetParameter(3) * binWidth, fFitTot->GetParameter(0), fFitTot->GetParameter(4));
+    g2->SetLineColor(kBlue);
+    g2->SetLineStyle(2);
+    g2->Draw("SAME");
+
+    // Componente di Fondo (espressa analiticamente come sopra)
+    TF1 *fBkg = new TF1("fBkg", [&](Double_t *x, Double_t *par){
+        Double_t x_min = 1.80; Double_t x_max = 1.95;
+        return par[0] * (1.0 + par[1] * (x[0] - 0.5*(x_max+x_min))) / (x_max - x_min) * binWidth;
+    }, 1.80, 1.95, 2);
+    fBkg->SetParameters(fFitTot->GetParameter(5), fFitTot->GetParameter(6));
+    fBkg->SetLineColor(kMagenta+1);
+    fBkg->SetLineStyle(7);
+    fBkg->SetLineWidth(2);
+    fBkg->Draw("SAME");
+
+    // =============================================================================
+    // 8. STIMA DELLE FRAZIONI NELLA SIGNAL REGION CON INCERTEZZA CORRETTA
+    // =============================================================================
+    
+    // Definiamo gli estremi della finestra di segnale (es. intorno al picco del D0)
+    Double_t sr_min = 1.835;
+    Double_t sr_max = 1.895;
+    
+    cout << "\n=============================================" << endl;
+    cout << "  CALCOLO FRAZIONI NELLA SIGNAL REGION [" << sr_min << ", " << sr_max << "] " << endl;
+    cout << "=============================================" << endl;
+
+    if (fitResult.Get() != nullptr) {
+        
+        // --- 1. VALORI CENTRALI ---
+        // Salviamo i parametri originali del fit
+        Double_t orig_pars[7];
+        for(int i=0; i<7; ++i) orig_pars[i] = fFitTot->GetParameter(i);
+
+        // Integrale Totale (S+B) nella Signal Region (senza binWidth grafico)
+        Double_t Tot = fFitTot->Integral(sr_min, sr_max) / binWidth;
+
+        // Integrale del solo Segnale (S): spegniamo temporaneamente l'Area_bkg (par[5])
+        fFitTot->SetParameter(5, 0.0);
+        Double_t S = fFitTot->Integral(sr_min, sr_max) / binWidth;
+
+        // Il Fondo (B) centrale è semplicemente la differenza
+        for(int i=0; i<7; ++i) fFitTot->SetParameter(i, orig_pars[i]);
+        Double_t B = Tot - S;
+
+        // --- 2. CALCOLO NUMERICO DEI GRADIENTI (Derivate Parziali) ---
+        Double_t dI_dS[7]   = {0.};
+        Double_t dI_dTot[7] = {0.};
+        Double_t eps = 1e-6; // Piccolo incremento per la derivazione numerica
+
+        for (int i = 0; i < 7; ++i) {
+            Double_t p_orig = orig_pars[i];
+            Double_t h = eps * (TMath::Abs(p_orig) > 0 ? TMath::Abs(p_orig) : 1.0);
+
+            // Valutazione a (p + h)
+            fFitTot->SetParameter(i, p_orig + h);
+            Double_t Tot_plus = fFitTot->Integral(sr_min, sr_max) / binWidth;
+            fFitTot->SetParameter(5, 0.0); // spegni fondo
+            Double_t S_plus = fFitTot->Integral(sr_min, sr_max) / binWidth;
+
+            // Valutazione a (p - h)
+            for(int k=0; k<7; ++k) fFitTot->SetParameter(k, orig_pars[k]); // reset
+            fFitTot->SetParameter(i, p_orig - h);
+            Double_t Tot_minus = fFitTot->Integral(sr_min, sr_max) / binWidth;
+            fFitTot->SetParameter(5, 0.0); // spegni fondo
+            Double_t S_minus = fFitTot->Integral(sr_min, sr_max) / binWidth;
+
+            // Ripristino definitivo dello stato iniziale dei parametri
+            for(int k=0; k<7; ++k) fFitTot->SetParameter(k, orig_pars[k]);
+
+            // Derivazione numerica centrale: (f(x+h) - f(x-h)) / (2*h)
+            dI_dS[i]   = (S_plus - S_minus) / (2.0 * h);
+            dI_dTot[i] = (Tot_plus - Tot_minus) / (2.0 * h);
+        }
+
+        // --- 3. PROPAGAZIONE DELLE VARIANZE CON LA MATRICE DI COVARIANZA ---
+        Double_t var_S = 0.0;
+        Double_t var_Tot = 0.0;
+        Double_t cov_S_Tot = 0.0;
+
+        for (int i = 0; i < 7; ++i) {
+            for (int j = 0; j < 7; ++j) {
+                Double_t cov_ij = fitResult->CovMatrix(i, j);
+                var_S     += dI_dS[i] * cov_ij * dI_dS[j];
+                var_Tot   += dI_dTot[i] * cov_ij * dI_dTot[j];
+                cov_S_Tot += dI_dS[i] * cov_ij * dI_dTot[j]; // Termine di correlazione incrociata
             }
         }
 
-        if (hMassData->GetEntries() == 0) {
-            cout << "Errore: Nessun evento trovato con id == 1!" << endl;
-            return;
-        }
+        Double_t err_S   = (var_S > 0) ? TMath::Sqrt(var_S) : 0.0;
+        Double_t err_Tot = (var_Tot > 0) ? TMath::Sqrt(var_Tot) : 0.0;
+        // Incertezza sul Fondo: Var(B) = Var(Tot - S) = Var(Tot) + Var(S) - 2*Cov(S,Tot)
+        Double_t var_B   = var_Tot + var_S - 2.0 * cov_S_Tot;
+        Double_t err_B   = (var_B > 0) ? TMath::Sqrt(var_B) : 0.0;
 
-        // 4. Definizione della funzione di Fit Totale: Segnale (f_2G_Shared) + Fondo (pol1)
-        // f_2G_Shared ha 5 parametri (indici 0-4). pol1 aggiunge altri 2 parametri (indici 5-6).
-        // Totale parametri = 7. Range ristretto per il fit come hai fatto sul MC.
-        TF1 *fFitTot = new TF1("fFitTot",
-                               [&](Double_t *x, Double_t *par) {
-                                   return f_2G_Shared(x, par) + par[5] + par[6]*x[0];
-                               }, 1.80, 1.95, 7);
+        // --- 4. FRAZIONI LOCALI E PROPAGAZIONE SUL RAPPORTO (Purezza F = S / Tot) ---
+        Double_t local_frac_sig = S / Tot;
+        Double_t local_frac_bkg = B / Tot;
 
-        /* NOTA: Se volessi un polinomio di secondo grado (pol2), ti basterebbe:
-           - Cambiare il numero totale di parametri da 7 a 8
-           - Modificare la lambda function aggiungendo "+ par[7]*x[0]*x[0]"
-        */
-
-        // 5. Stime iniziali basate sull'istogramma dei Dati
-        Double_t meanInit  = hMassData->GetBinCenter(hMassData->GetMaximumBin());
-        Double_t rmsInit   = hMassData->GetRMS();
-        Double_t binWidth  = hMassData->GetBinWidth(1);
-        Double_t totalEnt  = hMassData->Integral();
-        Double_t yieldInit = totalEnt * binWidth;
-
-        // Assegnazione dei parametri iniziali:
-        // [0] Shared_Mean, [1] Yield_1, [2] Sigma_1, [3] Yield_2, [4] Sigma_2
-        fFitTot->SetParameter(0, meanInit);
-        fFitTot->SetParameter(1, yieldInit * 0.4); // Ipotizziamo il 40% di segnale nella prima gaus
-        fFitTot->SetParameter(2, rmsInit * 0.4);
-        fFitTot->SetParameter(3, yieldInit * 0.2); // Ipotizziamo il 20% nella seconda gaus
-        fFitTot->SetParameter(4, rmsInit * 1.2);
+        // Derivate parziali analitiche della frazione rispetto a S e a Tot
+        Double_t df_dS   = 1.0 / Tot;
+        Double_t df_dTot = -S / (Tot * Tot);
         
-        // Parametri del fondo (pol1: par[5] è l'intercetta, par[6] è la pendenza)
-        // Una stima iniziale piatta sul valore medio del fondo ai bordi dell'istogramma:
-        Double_t bkgEstimatePerBin = hMassData->GetBinContent(1); // altezza del primo bin come stima del fondo
-        fFitTot->SetParameter(5, bkgEstimatePerBin);
-        fFitTot->SetParameter(6, 0.0); // pendenza iniziale piatta
+        // Formula del Delta sul rapporto:
+        Double_t var_frac = (df_dS * df_dS * var_S) + (df_dTot * df_dTot * var_Tot) + (2.0 * df_dS * df_dTot * cov_S_Tot);
+        Double_t err_frac = (var_frac > 0) ? TMath::Sqrt(var_frac) : 0.0;
 
-        // Nomi dei parametri per il box dei risultati grafico
-        fFitTot->SetParNames("Shared_Mean", "Yield_{1}", "#sigma_{1}", "Yield_{2}", "#sigma_{2}", "Bkg_Inter", "Bkg_Slope");
+        // --- 5. STAMPE DEI RISULTATI ---
+        cout << "Eventi di Segnale (S) nella SR = " << S << " +- " << err_S << endl;
+        cout << "Eventi di Fondo   (B) nella SR = " << B << " +- " << err_B << endl;
+        cout << "Eventi Totali   (S+B) nella SR = " << Tot << " +- " << err_Tot << endl;
+        cout << "---------------------------------------------" << endl;
+        cout << "PUREZZA DEL SEGNALE nella SR (S/S+B)  = (" << local_frac_sig * 100.0 << " +- " << err_frac * 100.0 << ") %" << endl;
+        cout << "CONTAMINAZIONE FONDO nella SR (B/S+B) = (" << local_frac_bkg * 100.0 << " +- " << err_frac * 100.0 << ") %" << endl;
+        cout << "=============================================" << endl;
+    }
 
-        // Limiti opzionali per evitare che il fit inverta le componenti o diverga
-        fFitTot->SetParLimits(0, 1.84, 1.88); // La massa del D0 è intorno a 1.864 GeV
-        fFitTot->SetParLimits(2, 0.002, 0.02);
-        fFitTot->SetParLimits(4, 0.01, 0.06);
-
-        // 6. Preparazione Canvas ed esecuzione del Fit
-        TCanvas *cMassData = new TCanvas("cMassData", "Mass Fit Data", 800, 600);
-        cMassData->cd();
-
-        cout << "\n--- Fitting Mass for Data (id==1) ---" << endl;
-        hMassData->Fit(fFitTot, "L I R");
-
-        // 7. Disegno delle componenti separate per controllo visivo
-        hMassData->Draw("E");
-        fFitTot->SetLineWidth(2);
-        fFitTot->Draw("SAME");
-
-        // Componente Segnale 1 (Gaussiana 1)
-        TF1 *g1 = new TF1("g1", "gaus", 1.80, 1.95);
-        g1->SetParameters(fFitTot->GetParameter(1), fFitTot->GetParameter(0), fFitTot->GetParameter(2));
-        g1->SetLineColor(kGreen+2);
-        g1->SetLineStyle(2);
-        g1->Draw("SAME");
-
-        // Componente Segnale 2 (Gaussiana 2)
-        TF1 *g2 = new TF1("g2", "gaus", 1.80, 1.95);
-        g2->SetParameters(fFitTot->GetParameter(3), fFitTot->GetParameter(0), fFitTot->GetParameter(4));
-        g2->SetLineColor(kBlue);
-        g2->SetLineStyle(2);
-        g2->Draw("SAME");
-
-        // Componente di Fondo (Polinomio)
-        TF1 *fBkg = new TF1("fBkg", "pol1", 1.80, 1.95);
-        fBkg->SetParameters(fFitTot->GetParameter(5), fFitTot->GetParameter(6));
-        fBkg->SetLineColor(kMagenta+1);
-        fBkg->SetLineStyle(7); // Tratteggio differente
-        fBkg->SetLineWidth(2);
-        fBkg->Draw("SAME");
-
-        // 8. Salvataggio risultati
-        cMassData->SaveAs("fit_mass_data.pdf");
-        cMassData->SaveAs("fit_mass_data.root");
+    cMassData->SaveAs("fit_mass_data.pdf");
+    cMassData->SaveAs("fit_mass_data.root");
 }
