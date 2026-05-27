@@ -200,6 +200,7 @@ class lifetimeANA
     std::vector<double> FitAcceptancePs(UInt_t seed = 0);
     void RunGlobalFit();
     void RunManualUnbinnedFit();
+    void RunDataFitFixed();
 
     // Background
     void MassRegions();

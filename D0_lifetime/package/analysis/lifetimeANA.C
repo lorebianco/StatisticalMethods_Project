@@ -1,6 +1,7 @@
 #include <RtypesCore.h>
 
 #include "GuiTypes.h"
+#include "Rtypes.h"
 #define lifetimeANA_cxx
 #include <iostream>
 
@@ -10,11 +11,14 @@
 #include <TCanvas.h>
 #include <TColor.h>
 #include <TF1.h>
+#include <TFitResult.h>
+#include <TFitResultPtr.h>
 #include <TH1.h>
 #include <TH2D.h>
 #include <TLegend.h>
 #include <TLine.h>
 #include <TMath.h>
+#include <TMatrixDSym.h>
 #include <TPaveStats.h>
 #include <TProfile.h>
 #include <TRandom3.h>
@@ -94,14 +98,22 @@ Double_t f_Bkg_Sides_mass(Double_t *x, Double_t *par)
 Double_t fBkg_Sides_time(Double_t *x, Double_t *par)
 {
     Double_t t = x[0];
-    Double_t mu = par[0];
-    Double_t A = par[1];
-    Double_t sigma = par[2];
-    Double_t alpha = par[3];
-    Double_t N = par[4];
+    Double_t mu = par[0]; // Turn-on shift (posizione del taglio di accettanza)
+    Double_t A = par[1]; // Turn-on width (risoluzione del taglio)
+    Double_t sigma = par[2]; // Vita media / scala
+    Double_t alpha = par[3]; // Esponente per la coda ( stretched exponential )
+    Double_t N = par[4]; // Normalizzazione
 
-    // TMath:: aggiunto, e il meno è FUORI da TMath::Power
-    return N * TMath::Erf(((t - mu) / A)) * TMath::Exp(-TMath::Power((t) / sigma, alpha));
+    // Evitiamo problemi matematici se t va leggermente sotto zero per arrotondamenti
+    Double_t time_term = (t > 0) ? t : 0.0001;
+
+    // ACCETTANZA: Scalata per andare da 0 a 1
+    Double_t acceptance = 0.5 * (1.0 + TMath::Erf((t - mu) / A));
+
+    // DECADIMENTO: Stretched exponential
+    Double_t decay = TMath::Exp(-TMath::Power(time_term / sigma, alpha));
+
+    return N * acceptance * decay;
 }
 
 class ExpoMultiGaussConv
@@ -275,6 +287,50 @@ class FullPDF_ConvAcc
     }
 };
 
+class TotalPDF_Data
+{
+  private:
+    TF1 *fSigPdf;
+    TF1 *fBkgPdf;
+    double fFbkg;
+    double fTMin;
+    double fTMax;
+    double fNormBkg; // Calcolato UNA SOLA VOLTA nel costruttore
+
+  public:
+    TotalPDF_Data(TF1 *sig, TF1 *bkg, double fbkg, double tmin, double tmax)
+        : fSigPdf(sig)
+        , fBkgPdf(bkg)
+        , fFbkg(fbkg)
+        , fTMin(tmin)
+        , fTMax(tmax)
+    {
+        // OTTIMIZZAZIONE: Il fondo è fisso, calcoliamo il suo integrale una volta sola qui!
+        fNormBkg = fBkgPdf->Integral(fTMin, fTMax, 1e-5);
+    }
+
+    double operator()(double *x, double *par)
+    {
+        double t = x[0];
+        double tau = par[0];
+
+        fSigPdf->SetParameter(0, tau);
+
+        // 1. Valori puntuali non normalizzati
+        double sigVal = fSigPdf->Eval(t);
+        double bkgVal = fBkgPdf->Eval(t);
+
+        // 2. Integrale del segnale (dipende da tau, va calcolato ad ogni step)
+        double normSig = fSigPdf->Integral(fTMin, fTMax, 1e-4);
+
+        if(normSig <= 0 || fNormBkg <= 0)
+            return 1e-10; // Protezione
+
+        // 3. Ritorna la PDF fisicamente e singolarmente normalizzata a 1
+        return (1.0 - fFbkg) * (sigVal / normSig) + fFbkg * (bkgVal / fNormBkg);
+    }
+};
+
 // --- UNBINNED LIKELIHOOD FIT ---
 class UnbinnedNLL
 {
@@ -319,6 +375,43 @@ class UnbinnedNLL
             else
             {
                 nll += 1e4; // Penalità severa per zone a probabilità <= 0
+            }
+        }
+        return nll;
+    }
+};
+
+class UnbinnedNLL_Fast
+{
+  private:
+    const std::vector<double> &fData;
+    TF1 *fPdf;
+
+  public:
+    UnbinnedNLL_Fast(const std::vector<double> &data, TF1 *pdf)
+        : fData(data)
+        , fPdf(pdf)
+    {
+    }
+
+    double operator()(const double *par) const
+    {
+        double tau = par[0];
+        fPdf->SetParameter(
+            0, tau); // Questo aggiorna tau e ricalcola l'integrale interno del segnale
+
+        double nll = 0.0;
+        for(double t : fData)
+        {
+            double pdf_val = fPdf->Eval(t);
+            if(pdf_val > 0)
+            {
+                // Non serve "- std::log(norm)" perché fPdf è già rigorosamente normalizzata a 1!
+                nll -= std::log(pdf_val);
+            }
+            else
+            {
+                nll += 1e4;
             }
         }
         return nll;
@@ -1499,6 +1592,102 @@ std::vector<double> lifetimeANA::FitResolutionNormalized()
         fRes->GetParameter(4), fRes->GetParameter(5) }; // {mu1, sig1, mu2, sig2, frac1}
 }
 
+std::vector<double> lifetimeANA::FitResolutionPs()
+{
+    SetLBStyle();
+    gStyle->SetOptFit(1111);
+    gStyle->SetStatX(0.995);
+    gStyle->SetStatY(0.993);
+
+    // Asse X in unità normalizzate (t/tau_MC). Range +/- 0.5 vite medie.
+    auto hRes = new TH1D(
+        "hRes_norm", "Time Resolution;(t_{reco} - t_{true}) [ps];Events", 100, -0.3, 0.3);
+
+    if(fChain == 0)
+        return {};
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        fChain->GetEntry(jentry);
+        if(id == 13)
+            hRes->Fill((M0_time - M0_time_true) * 1e12);
+    }
+
+    TF1 *fRes = new TF1("fRes_norm", f_2G_Frac, -0.5, 0.5, 6);
+    fRes->SetParameters(hRes->Integral() * hRes->GetBinWidth(1), 0.0, 0.05, 0.0, 0.15, 0.7);
+    fRes->SetParNames("Yield", "Mu_1", "Sigma_1", "Mu_2", "Sigma_2", "Frac_1");
+    fRes->SetParLimits(5, 0.0, 1.0); // Frazione tra 0 e 1
+
+    hRes->Fit(fRes, "L I R 0");
+
+    // --- DISEGNO CON PULL ---
+    TCanvas *c1 = new TCanvas("c_Res_Norm", "Resolution Fit", 800, 800);
+    TPad *pad1 = new TPad("pad1_res", "", 0, 0.3, 1, 1.0);
+    TPad *pad2 = new TPad("pad2_res", "", 0, 0.0, 1, 0.3);
+    pad1->SetBottomMargin(0.02);
+    pad2->SetTopMargin(0.02);
+    pad2->SetBottomMargin(0.3);
+    pad1->Draw();
+    pad2->Draw();
+
+    pad1->cd();
+    AddBinSizeOnYTitle(hRes, "ps");
+    hRes->GetXaxis()->SetLabelSize(0);
+    hRes->GetXaxis()->SetTitleSize(0);
+    hRes->Draw("E");
+    fRes->Draw("same");
+
+    TF1 *g1 = new TF1("g1_norm", "gaus", -0.5, 0.5);
+    g1->SetParameters(fRes->GetParameter(0) * fRes->GetParameter(5)
+            / (fRes->GetParameter(2) * TMath::Sqrt(TMath::TwoPi())),
+        fRes->GetParameter(1), fRes->GetParameter(2));
+    g1->SetLineStyle(2);
+    g1->SetLineColor(kGreen + 2);
+    g1->Draw("same");
+
+    TF1 *g2 = new TF1("g2_norm", "gaus", -0.5, 0.5);
+    g2->SetParameters(fRes->GetParameter(0) * (1.0 - fRes->GetParameter(5))
+            / (fRes->GetParameter(4) * TMath::Sqrt(TMath::TwoPi())),
+        fRes->GetParameter(3), fRes->GetParameter(4));
+    g2->SetLineStyle(2);
+    g2->SetLineColor(kCyan + 1);
+    g2->Draw("same");
+
+    pad2->cd();
+    pad2->SetGridy();
+    TH1D *hPull = (TH1D *)hRes->Clone("hPull_res");
+    hPull->Reset();
+    for(int i = 1; i <= hRes->GetNbinsX(); i++)
+    {
+        double err = hRes->GetBinError(i);
+        if(err > 0)
+            hPull->SetBinContent(
+                i, (hRes->GetBinContent(i) - fRes->Eval(hRes->GetBinCenter(i))) / err);
+    }
+    hPull->GetYaxis()->SetTitle("Pull");
+    hPull->GetYaxis()->SetTitleSize(gStyle->GetTitleSize("Y"));
+    hPull->GetYaxis()->SetLabelSize(gStyle->GetLabelSize("Y"));
+    hPull->GetYaxis()->SetTitleOffset(gStyle->GetTitleOffset("Y"));
+    hPull->GetYaxis()->SetRangeUser(-5, 5);
+
+    hPull->GetXaxis()->SetTitle("(t_{reco} - t_{true}) / #tau_{MC}");
+    hPull->GetXaxis()->SetTitleSize(gStyle->GetTitleSize("X"));
+    hPull->GetXaxis()->SetLabelSize(gStyle->GetLabelSize("X"));
+    hPull->GetXaxis()->SetTitleOffset(gStyle->GetTitleOffset("X"));
+
+    hPull->Draw("P");
+
+    c1->Update();
+
+    if(savePlots)
+        c1->SaveAs("plot_1_Resolution.pdf");
+
+    // Ritorna i parametri estratti
+    return { fRes->GetParameter(1), fRes->GetParameter(2), fRes->GetParameter(3),
+        fRes->GetParameter(4), fRes->GetParameter(5) }; // {mu1, sig1, mu2, sig2, frac1}
+}
+
 // ==============================================================================
 // 2. FIT DELL'ACCETTANZA (in unità normalizzate t/Tau)
 // ==============================================================================
@@ -1560,6 +1749,110 @@ std::vector<double> lifetimeANA::FitAcceptanceNormalized(UInt_t seed)
 
     return { fAcc->GetParameter(0), fAcc->GetParameter(1), fAcc->GetParameter(2),
         fAcc->GetParameter(3), fAcc->GetParameter(4) }; // {frac, mu1, sig1, mu2, sig2}
+}
+
+std::vector<double> lifetimeANA::FitAcceptancePs(UInt_t seed)
+{
+    SetLBStyle();
+    TRandom3 rnd(seed);
+
+    // Istogrammi a 50 bin da 0 a 5 ps (esattamente come nel tuo codice)
+    TH1D *hTime_gen = new TH1D("hTime_Gen_Acc", "", 50, 0., 5.);
+    TH1D *hTime_rec = new TH1D("hTime_Rec_Acc", "Acceptance Fit;t [ps];Acceptance", 50, 0., 5.);
+    hTime_gen->Sumw2();
+    hTime_rec->Sumw2();
+
+    for(int i = 0; i < fChain->GetEntriesFast(); i++)
+    {
+        if(LoadTree(i) < 0)
+            break;
+        fChain->GetEntry(i);
+        if(id == 13)
+            hTime_rec->Fill(M0_time_true * 1e12);
+    }
+
+    for(int i = 0; i < 1e9; i++)
+        hTime_gen->Fill(rnd.Exp(MC_LIFE * 1e12));
+
+    hTime_rec->Divide(hTime_rec, hTime_gen, 1.0, 1.0, "B");
+
+    // ==============================================================================
+    // STIMA DEL PLATEAU CON IL METODO DELLA MODA (Valore di bin più popolato)
+    // ==============================================================================
+    double xMinPlateau = 1.0;
+    double xMaxPlateau = 4.5;
+    int binMin = hTime_rec->FindBin(xMinPlateau);
+    int binMax = hTime_rec->FindBin(xMaxPlateau);
+
+    double minVal = 1e9, maxVal = -1e9;
+    std::vector<double> validValues;
+
+    for(int b = binMin; b <= binMax; b++)
+    {
+        double val = hTime_rec->GetBinContent(b);
+        if(val > 1e-5)
+        {
+            if(val < minVal)
+                minVal = val;
+            if(val > maxVal)
+                maxVal = val;
+            validValues.push_back(val);
+        }
+    }
+
+    double plateauValue = 1.0;
+    if(validValues.size() > 0)
+    {
+        // Istogramma di supporto per trovare il valore di accettanza più frequente
+        TH1D hMode("hMode", "", 30, minVal * 0.9, maxVal * 1.1);
+        for(double v : validValues)
+        {
+            hMode.Fill(v);
+        }
+        int maxBin = hMode.GetMaximumBin();
+        plateauValue = hMode.GetBinCenter(maxBin);
+    }
+
+    // Riscaliamo l'accettanza
+    if(plateauValue > 0)
+        hTime_rec->Scale(1.0 / plateauValue);
+
+    // ==============================================================================
+    // FUNZIONE DI ACCETTANZA (Adattata a 5.0 ps)
+    // ==============================================================================
+    // CORREZIONE 1: Il range della TF1 deve essere coerente con l'istogramma (0.0, 5.0)
+    TF1 *fAcc = new TF1("fAcc_Fit",
+        "0.5 * ( [0]*(1.0 + TMath::Erf((x-[1])/[2])) + (1.0-[0])*(1.0 + TMath::Erf((x-[3])/[4])) )",
+        0.0, 5.0);
+
+    // CORREZIONE 2: Parametri iniziali riscaldati matematicamente (moltiplicati per 0.4103)
+    // Questo garantisce che la forma di partenza sia IDENTICA a quella normalizzata
+    double mc_life_ps = MC_LIFE * 1e12; // 0.4103 ps
+    fAcc->SetParameter(0, 0.5); // Frazione (adimensionale)
+    fAcc->SetParameter(1, 0.5 * mc_life_ps); // Mu_1 in ps (circa 0.205)
+    fAcc->SetParameter(2, 0.2 * mc_life_ps); // Sig_1 in ps (circa 0.082)
+    fAcc->SetParameter(3, 1.5 * mc_life_ps); // Mu_2 in ps (circa 0.615)
+    fAcc->SetParameter(4, 1.0 * mc_life_ps); // Sig_2 in ps (circa 0.410)
+
+    fAcc->SetParNames("Frac", "Mu_1", "Sig_1", "Mu_2", "Sig_2");
+
+    // Limiti di sicurezza per aiutare la convergenza
+    fAcc->SetParLimits(0, 0.0, 1.0);
+
+    hTime_rec->Fit(fAcc, "LRI0");
+
+    TCanvas *c2 = new TCanvas("c_Acc", "Acceptance Fit", 800, 600);
+    hTime_rec->SetMarkerStyle(20);
+    hTime_rec->GetYaxis()->SetRangeUser(0, 2.);
+    AddBinSizeOnYTitle(hTime_rec, "ps");
+    hTime_rec->Draw("E");
+    fAcc->Draw("same");
+
+    if(savePlots)
+        c2->SaveAs("plot_2_Acceptance.pdf");
+
+    return { fAcc->GetParameter(0), fAcc->GetParameter(1), fAcc->GetParameter(2),
+        fAcc->GetParameter(3), fAcc->GetParameter(4) };
 }
 
 // ==============================================================================
@@ -1904,13 +2197,18 @@ void lifetimeANA::MassRegions()
     // 1. Convertiamo i valori reali in numeri di bin corrispondenti
     int binMin = hMass_MC->FindBin(1.835);
     int binMax = hMass_MC->FindBin(1.895);
+    Double_t minSig = hMass_MC->GetBinCenter(binMin);
+    Double_t maxSig = hMass_MC->GetBinCenter(binMax);
+
+    // Limiti assoluti dell'istogramma dati
+    Double_t massMin = hMass_Data->GetXaxis()->GetXmin();
+    Double_t massMax = hMass_Data->GetXaxis()->GetXmax();
 
     // 2. Calcoliamo l'integrale usando i bin trovati
     auto integral_MC = hMass_MC->Integral(binMin, binMax);
 
     // 3. Calcoliamo la frazione rispetto all'integrale totale
     cout << "Integral MC / Total MC: " << (integral_MC / hMass_MC->Integral()) * 100 << "%" << endl;
-
     cout << "Max bin MC: " << hMass_MC->GetBinCenter(hMass_MC->GetMaximumBin()) << endl;
     cout << "Max bin data: " << hMass_Data->GetBinCenter(hMass_Data->GetMaximumBin()) << endl;
 
@@ -1924,25 +2222,19 @@ void lifetimeANA::MassRegions()
     auto c_mass_Data = new TCanvas("c_mass_Data", "Mass Data", 800, 600);
     hMass_Data->Draw();
 
-    if(savePlots)
-    {
-        c_mass_MC->SaveAs("plot_6_MassMC.pdf");
-        c_mass_Data->SaveAs("plot_6_MassData.pdf");
-    }
-
     // ==============================================================================
     // Lifetimes - Fondo fittato con Modello Completo (Conv + Acc)
     // ==============================================================================
-    Double_t minSig = hMass_MC->GetBinCenter(binMin);
-    Double_t maxSig = hMass_MC->GetBinCenter(binMax);
-
     // Time histograms
     auto hTime_left = new TH1D("hTime_left", "Time (Left Sideband);t [ps];Events", 100, 0, 10);
     auto hTime_right = new TH1D("hTime_right", "Time (Right Sideband);t [ps];Events", 100, 0, 10);
+    auto hTime_both = new TH1D("hTime_both", "Time (Both Sidebands);t [ps];Events", 100, 0, 10);
     AddBinSizeOnYTitle(hTime_left, "ps");
     AddBinSizeOnYTitle(hTime_right, "ps");
+    AddBinSizeOnYTitle(hTime_both, "ps");
     hTime_left->Sumw2();
     hTime_right->Sumw2();
+    hTime_both->Sumw2();
 
     for(int i = 0; i < fChain->GetEntriesFast(); i++)
     {
@@ -1952,71 +2244,366 @@ void lifetimeANA::MassRegions()
         if(id == 1) // Data
         {
             if(M0_MKpi < minSig)
+            {
                 hTime_left->Fill(M0_time * 1e12);
+                hTime_both->Fill(M0_time * 1e12);
+            }
             else if(M0_MKpi > maxSig)
+            {
                 hTime_right->Fill(M0_time * 1e12);
+                hTime_both->Fill(M0_time * 1e12);
+            }
         }
     }
 
-    Double_t minT = 0.15; // Scegli il range appropriato
+    cout << "N_left: " << hTime_left->GetEntries() << ", N_right: " << hTime_right->GetEntries()
+         << ", N_both: " << hTime_both->GetEntries() << endl;
+
+    Double_t minT = 0.; // Scegli il range appropriato
     Double_t maxT = 10.0;
 
+    // ==============================================================================
+    // SCELTA DEL MODELLO DI BACKGROUND E FIT
+    // ==============================================================================
     auto fFitLeft = new TF1("fFitLeft", fBkg_Sides_time, minT, maxT, 5);
     auto fFitRight = new TF1("fFitRight", fBkg_Sides_time, minT, maxT, 5);
+    auto fFitBoth = new TF1("fFitBoth", fBkg_Sides_time, minT, maxT, 5);
+    fFitLeft->SetParNames("mu", "A", "sigma", "alpha", "N");
+    fFitRight->SetParNames("mu", "A", "sigma", "alpha", "N");
+    fFitBoth->SetParNames("mu", "A", "sigma", "alpha", "N");
+
     fFitLeft->SetNpx(1000);
     fFitRight->SetNpx(1000);
+    fFitBoth->SetNpx(1000);
 
-    fFitLeft->SetParameters(0.17, 0.28, 1.46, 0.97, 1940);
-    fFitRight->SetParameters(0.17, 0.28, 1.46, 0.97, 1940);
-
-    // 4. Fit!
     std::cout << "\n--- Fitting Left Sideband ---" << std::endl;
-    hTime_left->Fit(fFitLeft, "L I R 0");
+    fFitLeft->SetParameters(0.3, 0.1, 1.6, 1.02, 1740);
+    // IMPORTANTE: Aggiunta opzione "S" per salvare la matrice di covarianza
+    TFitResultPtr rLeft = hTime_left->Fit(fFitLeft, "L I R S 0");
 
     std::cout << "\n--- Fitting Right Sideband ---" << std::endl;
-    hTime_right->Fit(fFitRight, "L I R 0");
+    fFitRight->SetParameters(fFitLeft->GetParameters());
+    TFitResultPtr rRight = hTime_right->Fit(fFitRight, "L I R S 0");
 
     // ==============================================================================
-    // 5. Plotting
+    // 5. Plotting Sidebands
     // ==============================================================================
     gStyle->SetOptFit(1111);
 
-    // --- Plot Left Sideband ---
     auto c_time_left = new TCanvas("c_time_left", "Time Left Sideband", 800, 600);
-    c_time_left->SetLogy(); // Utile per vedere la coda esponenziale
-
+    c_time_left->SetLogy();
     hTime_left->SetMarkerStyle(20);
     hTime_left->SetMarkerSize(0.8);
     hTime_left->SetLineColor(kGreen + 2);
     hTime_left->SetMarkerColor(kGreen + 2);
     hTime_left->SetMinimum(0.5);
-
     fFitLeft->SetLineWidth(2);
-
     hTime_left->Draw("E");
     fFitLeft->Draw("SAME");
 
-    // --- Plot Right Sideband ---
     auto c_time_right = new TCanvas("c_time_right", "Time Right Sideband", 800, 600);
     c_time_right->SetLogy();
-
     hTime_right->SetMarkerStyle(20);
     hTime_right->SetMarkerSize(0.8);
     hTime_right->SetLineColor(kMagenta + 2);
     hTime_right->SetMarkerColor(kMagenta + 2);
     hTime_right->SetMinimum(0.5);
-
     fFitRight->SetLineWidth(2);
-
     hTime_right->Draw("E");
     fFitRight->Draw("SAME");
 
-    // 6. Salvataggio
+    // ==============================================================================
+    // 6. INTERPOLAZIONE LINEARE CINEMATICA (CON MATRICE DI COVARIANZA)
+    // ==============================================================================
+    std::cout << "\n=======================================================" << std::endl;
+    std::cout << "   INTERPOLAZIONE PARAMETRI DI BKG E LORO INCERTEZZA   " << std::endl;
+    std::cout << "=======================================================\n" << std::endl;
+
+    // A. Calcolo dei centri in massa (baricentri delle regioni)
+    Double_t m_L = (massMin + minSig) / 2.0;
+    Double_t m_S = (minSig + maxSig) / 2.0;
+    Double_t m_R = (maxSig + massMax) / 2.0;
+
+    std::cout << Form("Centri di Massa -> Left: %.3f, Signal: %.3f, Right: %.3f", m_L, m_S, m_R)
+              << std::endl;
+
+    // Fattori di peso per l'interpolazione
+    Double_t c = (m_S - m_L) / (m_R - m_L);
+    Double_t wL = 1.0 - c;
+    Double_t wR = c;
+
+    // Array per salvare i parametri fittati (solo i 4 di shape)
+    const int nShapePars = 4;
+    Double_t p_L[nShapePars], p_R[nShapePars], p_S[nShapePars];
+
+    for(int i = 0; i < nShapePars; i++)
+    {
+        p_L[i] = fFitLeft->GetParameter(i);
+        p_R[i] = fFitRight->GetParameter(i);
+
+        // B. Formula di interpolazione lineare (scritta con i pesi wL e wR)
+        p_S[i] = wL * p_L[i] + wR * p_R[i];
+    }
+
+    // C. Estrazione ed interpolazione delle Matrici di Covarianza
+    TMatrixDSym covL(nShapePars);
+    TMatrixDSym covR(nShapePars);
+
+    // Riempiamo le matrici 4x4 (ignorando la normalizzazione N che è il parametro 4)
+    for(int i = 0; i < nShapePars; i++)
+    {
+        for(int j = 0; j < nShapePars; j++)
+        {
+            covL(i, j) = rLeft->CovMatrix(i, j);
+            covR(i, j) = rRight->CovMatrix(i, j);
+        }
+    }
+
+    // Propagazione della covarianza: V_S = (wL^2 * V_L) + (wR^2 * V_R)
+    TMatrixDSym covS(nShapePars);
+    TMatrixDSym scaledCovL = covL;
+    scaledCovL *= (wL * wL);
+    TMatrixDSym scaledCovR = covR;
+    scaledCovR *= (wR * wR);
+    covS = scaledCovL + scaledCovR;
+
+    // Array per gli errori interpolati (radice quadrata della diagonale della matrice)
+    Double_t err_S[nShapePars];
+    for(int i = 0; i < nShapePars; i++)
+    {
+        err_S[i] = TMath::Sqrt(covS(i, i));
+    }
+
+    // D. Stampa dei Risultati
+    std::cout << "\nParametri di Shape Estratti per la Signal Region (con errori propagati):"
+              << std::endl;
+    std::cout << "----------------------------------------------------------------------"
+              << std::endl;
+    std::cout << Form("mu_bkg    = %8.5f +/- %8.5f", p_S[0], err_S[0]) << std::endl;
+    std::cout << Form("A_bkg     = %8.5f +/- %8.5f", p_S[1], err_S[1]) << std::endl;
+    std::cout << Form("sigma_bkg = %8.5f +/- %8.5f", p_S[2], err_S[2]) << std::endl;
+    std::cout << Form("alpha_bkg = %8.5f +/- %8.5f", p_S[3], err_S[3]) << std::endl;
+
+    std::cout << "\nMatrice di Covarianza Interpolata (da usare per i Nuisance Parameters):"
+              << std::endl;
+    covS.Print();
+
+    // Se ti serve la matrice inversa per la NLL:
+    TMatrixDSym invCovS = covS;
+    invCovS.Invert();
+    // invCovS.Print(); // Decommenta per vedere la matrice di precisione
+
+    // (Opzionale) Disegno della curva interpolata per controllo visivo
+    auto c_interpolated = new TCanvas("c_interpolated", "Interpolated Bkg Shape", 800, 600);
+    c_interpolated->SetLogy();
+    auto fFitSignalBkg = new TF1("fFitSignalBkg", fBkg_Sides_time, minT, maxT, 5);
+    for(int i = 0; i < nShapePars; i++)
+        fFitSignalBkg->SetParameter(i, p_S[i]);
+    // Mettiamo una normalizzazione fittizia solo per vederlo nel plot
+    fFitSignalBkg->SetParameter(4, (fFitLeft->GetParameter(4) + fFitRight->GetParameter(4)) / 2.0);
+    fFitSignalBkg->SetLineColor(kBlue);
+    fFitSignalBkg->SetTitle(
+        "Interpolated Background Shape in Signal Region;t [ps];Arbitrary Units");
+    fFitSignalBkg->Draw();
+
+    // Now fit both sidebands and compare the results
+    std::cout << "\n--- Fitting Both Sideband ---" << std::endl;
+    fFitBoth->SetParameters(
+        p_S[0], p_S[1], p_S[2], p_S[3], fFitLeft->GetParameter(4) + fFitRight->GetParameter(4));
+    hTime_both->Fit(fFitBoth, "L I R 0");
+
+    auto c_time_both = new TCanvas("c_time_both", "Time Both Sidebands", 800, 600);
+    c_time_both->SetLogy();
+    hTime_both->SetMarkerStyle(20);
+    hTime_both->SetMarkerSize(0.8);
+    hTime_both->SetLineColor(kBlue + 2);
+    hTime_both->SetMarkerColor(kBlue + 2);
+    hTime_both->SetMinimum(0.5);
+    fFitBoth->SetLineWidth(2);
+    hTime_both->Draw("E");
+    fFitBoth->Draw("SAME");
+
     if(savePlots)
     {
         c_mass_MC->SaveAs("plot_6_MassMC.pdf");
         c_mass_Data->SaveAs("plot_6_MassData.pdf");
         c_time_left->SaveAs("plot_6_TimeLeft_ConvFit.pdf");
         c_time_right->SaveAs("plot_6_TimeRight_ConvFit.pdf");
+        c_interpolated->SaveAs("plot_6_TimeBkg_Interpolated.pdf");
     }
+}
+
+void lifetimeANA::RunDataFitFixed()
+{
+    SetLBStyle();
+
+    std::cout << "\n=============================================" << std::endl;
+    std::cout << " PREPARAZIONE FIT SUI DATI (UNBINNED - FIXED)" << std::endl;
+    std::cout << "=============================================\n" << std::endl;
+
+    // 1. Estrazione Parametri Ausiliari (Assicurati che queste funzioni restituiscano valori in
+    // ps!)
+    std::vector<double> resPars = FitResolutionPs();
+    std::vector<double> accPars = FitAcceptancePs(42);
+
+    // Parametri del fondo interpolati dalla Signal Region (Inserisci i numeri estratti in
+    // MassRegions)
+    double mu_bkg = 0.28734; // SOSTITUISCI CON IL TUO p_S[0]
+    double A_bkg = 0.10555; // SOSTITUISCI CON IL TUO p_S[1]
+    double sigma_bkg = 1.55658; // SOSTITUISCI CON IL TUO p_S[2]
+    double alpha_bkg = 1.01763; // SOSTITUISCI CON IL TUO p_S[3]
+
+    // Frazione di fondo sotto il picco del segnale (Ricavata dai fit in massa, metto un numero
+    // dummy)
+    double f_bkg = 0.40;
+
+    Double_t minT = 0.2; // Taglio minimo in ps
+    Double_t maxT = 10.0; // Taglio massimo in ps
+
+    // 2. Costruzione della PDF del Segnale
+    FullPDF_ConvAcc fSigModel(2, true);
+    TF1 *fSig = new TF1("fSig", fSigModel, minT, maxT, fSigModel.GetNPar());
+    fSig->FixParameter(1, resPars[0]);
+    fSig->FixParameter(2, resPars[2]);
+    fSig->FixParameter(3, 1.0); // Yield fisso a 1 per normalizzazione
+    fSig->FixParameter(4, resPars[1]);
+    fSig->FixParameter(5, resPars[3]);
+    fSig->FixParameter(6, resPars[4]);
+    fSig->FixParameter(7, accPars[0]);
+    fSig->FixParameter(8, accPars[1]);
+    fSig->FixParameter(9, accPars[2]);
+    fSig->FixParameter(10, accPars[3]);
+    fSig->FixParameter(11, accPars[4]);
+
+    // 3. Costruzione della PDF del Fondo
+    TF1 *fBkg = new TF1("fBkg", fBkg_Sides_time, minT, maxT, 5);
+    fBkg->FixParameter(0, mu_bkg);
+    fBkg->FixParameter(1, A_bkg);
+    fBkg->FixParameter(2, sigma_bkg);
+    fBkg->FixParameter(3, alpha_bkg);
+    fBkg->FixParameter(4, 1.0); // Norm fissa a 1
+
+    // 4. Estrazione Dati Reali (id == 1) nella finestra di massa del segnale
+    std::vector<double> t_data;
+    auto hTime_Data
+        = new TH1D("hTime_Data", "Data in Signal Region;t [ps];Events", 100, minT, maxT);
+    hTime_Data->Sumw2();
+
+    double mass_min = 1.835; // Stessi limiti usati in MassRegions per binMin/binMax
+    double mass_max = 1.895;
+
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        fChain->GetEntry(jentry);
+
+        if(id == 1) // DATA
+        {
+            if(M0_MKpi >= mass_min && M0_MKpi <= mass_max) // Siamo nel picco
+            {
+                double t_ps = M0_time * 1e12; // t in ps
+                if(t_ps >= minT && t_ps <= maxT)
+                {
+                    t_data.push_back(t_ps);
+                    hTime_Data->Fill(t_ps);
+                }
+            }
+        }
+    }
+    std::cout << "--> Trovati " << t_data.size() << " eventi nei DATI." << std::endl;
+
+    // 5. Creazione PDF Totale e NLL (Notare che passiamo anche minT e maxT al costruttore)
+    TotalPDF_Data fTotModel(fSig, fBkg, f_bkg, minT, maxT);
+    TF1 *fTot = new TF1("fTot", fTotModel, minT, maxT, 1);
+
+    // Usiamo la nuova classe ultra-veloce ed esatta!
+    UnbinnedNLL_Fast nllFunc(t_data, fTot);
+
+    // 6. MINUIT!
+    ROOT::Math::Minimizer *minuit = ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+    minuit->SetMaxFunctionCalls(10000);
+    minuit->SetTolerance(0.001);
+    minuit->SetPrintLevel(1);
+
+    ROOT::Math::Functor fcn(nllFunc, 1);
+    minuit->SetFunction(fcn);
+
+    // Variabile 0: Tau (in picosecondi). Partiamo da ~0.410 ps.
+    minuit->SetVariable(0, "Tau", 0.410, 0.005);
+
+    std::cout << "\nStarting Minuit minimization on DATA..." << std::endl;
+    minuit->Minimize();
+    minuit->Hesse();
+
+    double bestTau = minuit->X()[0];
+    double errTau = minuit->Errors()[0];
+
+    std::cout << "\n=============================================" << std::endl;
+    std::cout << " DATA FIT CONCLUSO! " << std::endl;
+    std::cout << " Vita media fittata: " << bestTau << " +/- " << errTau << " ps" << std::endl;
+    std::cout << "=============================================\n" << std::endl;
+
+    // ==============================================================================
+    // 7. DISEGNO (Plot Totale e Componenti con scale corrette tramite Lambda)
+    // ==============================================================================
+    TCanvas *c_data = new TCanvas("c_data", "Data Fit", 800, 800);
+    c_data->SetLogy();
+
+    hTime_Data->SetMarkerStyle(20);
+    hTime_Data->SetMinimum(0.5);
+    hTime_Data->Draw("E");
+
+    // Impostiamo il Tau ottimale trovato dal fit prima di calcolare gli integrali
+    fTot->SetParameter(0, bestTau);
+    fSig->SetParameter(0, bestTau);
+
+    // Calcoliamo i fattori di scala
+    double binW = hTime_Data->GetBinWidth(1);
+    double scaleTot = t_data.size() * binW / fTot->Integral(minT, maxT);
+    double scaleSig = scaleTot * (1.0 - f_bkg);
+    double scaleBkg = scaleTot * f_bkg;
+
+    // --- A. DISEGNO CURVA TOTALE ---
+    // Creiamo un TF1 temporaneo che valuta la funzione fTot moltiplicata per il suo fattore di
+    // scala
+    TF1 *fTotDraw = new TF1(
+        "fTotDraw", [=](double *x, double *p) { return scaleTot * fTot->Eval(x[0]); }, minT, maxT,
+        0); // 0 parametri liberi, è solo per disegno
+    fTotDraw->SetLineColor(kBlue);
+    fTotDraw->SetLineWidth(3);
+    fTotDraw->Draw("SAME");
+
+    // --- B. DISEGNO COMPONENTE SEGNALE ---
+    TF1 *fSigDraw = new TF1(
+        "fSigDraw",
+        [=](double *x, double *p)
+        {
+            double integral = fSig->Integral(minT, maxT);
+            return (integral > 0) ? (scaleSig * fSig->Eval(x[0]) / integral) : 0.0;
+        },
+        minT, maxT, 0);
+    fSigDraw->SetLineColor(kRed);
+    fSigDraw->SetLineStyle(2);
+    fSigDraw->SetLineWidth(2);
+    fSigDraw->Draw("SAME");
+
+    // --- C. DISEGNO COMPONENTE FONDO ---
+    TF1 *fBkgDraw = new TF1(
+        "fBkgDraw",
+        [=](double *x, double *p)
+        {
+            double integral = fBkg->Integral(minT, maxT);
+            return (integral > 0) ? (scaleBkg * fBkg->Eval(x[0]) / integral) : 0.0;
+        },
+        minT, maxT, 0);
+    fBkgDraw->SetLineColor(kGreen + 2);
+    fBkgDraw->SetLineStyle(2);
+    fBkgDraw->SetLineWidth(2);
+    fBkgDraw->Draw("SAME");
+
+    if(savePlots)
+        c_data->SaveAs("plot_7_DataFit_Fixed.pdf");
+
+    delete minuit;
 }
