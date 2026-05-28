@@ -1,8 +1,0 @@
-*.d
-*.pcm
-*.png
-*.pdf
-_plots/
-_backup_*
-.clang-format
-.clang-format
