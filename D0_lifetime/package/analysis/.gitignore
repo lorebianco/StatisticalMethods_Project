@@ -1,0 +1,6 @@
+*.d
+*.pcm
+*.png
+*.pdf
+_plots/
+_backup_*
