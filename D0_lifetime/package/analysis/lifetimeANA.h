@@ -8,13 +8,46 @@
 #ifndef lifetimeANA_h
 #define lifetimeANA_h
 
+#include <iostream>
+
 #include <TChain.h>
 #include <TFile.h>
+#include <TMatrixDSym.h>
 #include <TROOT.h>
 
 #include "RtypesCore.h"
 
 // Header file for the classes stored in the TTree if any.
+
+// --- Structs ---
+struct AuxFitResult
+{
+    std::vector<double> pars;
+    TMatrixDSym cov;
+    TMatrixDSym invCov;
+    bool isValid;
+
+    AuxFitResult(int n)
+        : pars(n, 0.0)
+        , cov(n)
+        , invCov(n)
+        , isValid(false)
+    {
+    }
+
+    void SetAndInvert(const std::vector<double> &p, const TMatrixDSym &c)
+    {
+        pars = p;
+        cov = c;
+        invCov = c;
+        // Invertiamo la matrice per avere la Matrice dei Pesi (W = V^-1)
+        double det = 0;
+        invCov.Invert(&det);
+        isValid = (det != 0);
+        if(!isValid)
+            std::cout << "ATTENZIONE: Matrice non invertibile!" << std::endl;
+    }
+};
 
 class lifetimeANA
 {
@@ -196,14 +229,15 @@ class lifetimeANA
     // Signal-Only Pipeline
     std::vector<double> FitResolutionNormalized();
     std::vector<double> FitAcceptanceNormalized(UInt_t seed = 0);
-    std::vector<double> FitResolutionPs();
-    std::vector<double> FitAcceptancePs(UInt_t seed = 0);
+    AuxFitResult FitResolutionPs();
+    AuxFitResult FitAcceptancePs(UInt_t seed = 0);
     void RunGlobalFit();
     void RunManualUnbinnedFit();
     void RunDataFitFixed();
+    void RunDataFitProfiled();
 
     // Background
-    void MassRegions();
+    AuxFitResult MassRegions();
 };
 
 #endif

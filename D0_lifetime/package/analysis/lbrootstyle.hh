@@ -8,6 +8,7 @@
 #include <TGaxis.h>
 #include <TH1.h>
 #include <TLatex.h>
+#include <TMath.h>
 #include <TPad.h>
 #include <TPaveText.h>
 #include <TROOT.h>
@@ -185,6 +186,68 @@ inline void AddBinSizeOnYTitle(TH1 *h, TString unit = "", TString yTitleStr = "E
         newTitle = Form("%s / (%s)", yTitleStr.Data(), valStr.Data());
     }
     h->GetYaxis()->SetTitle(newTitle);
+}
+
+inline void RoundPDG(
+    Double_t val, Double_t err, Double_t &rounded_val, Double_t &rounded_err, Int_t &decimals)
+{
+    if(err <= 0)
+    {
+        rounded_val = val;
+        rounded_err = err;
+        decimals = 0;
+        return;
+    }
+
+    Int_t exponent = TMath::Floor(TMath::Log10(err));
+    Double_t scale = TMath::Power(10, -exponent + 2);
+    Double_t scaled_err = err * scale;
+    Int_t three_digits = TMath::Nint(scaled_err); // Arrotonda all'intero più vicino
+
+    if(three_digits >= 1000)
+    {
+        three_digits /= 10;
+        exponent++;
+    }
+
+    Int_t first_two = three_digits / 10;
+    Int_t sig_digits_err = 0;
+
+    if(first_two >= 10 && first_two <= 35)
+    {
+        sig_digits_err = 2;
+    }
+    else if(first_two >= 36 && first_two <= 94)
+    {
+        sig_digits_err = 1;
+    }
+    else
+    {
+        sig_digits_err = 2;
+    }
+
+    Int_t round_to_exponent = (sig_digits_err == 2) ? (exponent - 1) : exponent;
+    Double_t round_scale = TMath::Power(10, -round_to_exponent);
+
+    rounded_err = TMath::Nint(err * round_scale) / round_scale;
+    rounded_val = TMath::Nint(val * round_scale) / round_scale;
+
+    decimals = (round_to_exponent < 0) ? -round_to_exponent : 0;
+}
+
+inline TString FormatPDG(Double_t val, Double_t err, TString unit = "")
+{
+    Double_t r_val, r_err;
+    Int_t dec;
+    RoundPDG(val, err, r_val, r_err, dec);
+
+    TString formatStr = Form("%%.%df #pm %%.%df", dec, dec);
+    TString out = Form(formatStr.Data(), r_val, r_err);
+    if(unit != "")
+    {
+        out = Form("(%s) %s", out.Data(), unit.Data());
+    }
+    return out;
 }
 
 // Add texts
