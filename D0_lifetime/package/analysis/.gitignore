@@ -4,3 +4,4 @@
 *.pdf
 _plots/
 _backup_*
+.clang-format
