@@ -14,11 +14,19 @@
 
 #include <TChain.h>
 #include <TFile.h>
+#include <TH1D.h>
 #include <TROOT.h>
 
 using namespace std;
 
-#define MC
+// User-defined struct for storing fit results
+struct AuxFitResult
+{
+    std::vector<Double_t> params;
+    std::vector<Double_t> errors;
+    std::vector<std::vector<Double_t>> covMatrix;
+    bool isValid = false;
+};
 
 // Header file for the classes stored in the TTree if any.
 
@@ -214,8 +222,10 @@ class analysis
     TBranch *b_D_time_true; //!
     TBranch *b_D_M; //!
 
-    analysis(TTree *tree = 0);
+    analysis(bool isMC = true);
     virtual ~analysis();
+    void LoadDataset(bool isMC);
+
     // virtual Int_t    Cut(Long64_t entry);
     virtual Int_t GetEntry(Long64_t entry);
     virtual Long64_t LoadTree(Long64_t entry);
@@ -225,49 +235,63 @@ class analysis
     virtual void Show(Long64_t entry = -1);
 
     // User functions
-    void FitTemplateMass(Int_t mcID);
-    void FitCombinatorialBkg();
+    AuxFitResult FitTemplateMass(Int_t mcID);
+    AuxFitResult FitCombinatorialBkg();
+    void DoFullBlindedUnbinnedFit();
+
+    // Helpers for blind analysis
+    inline TH1D *GetBlindedClone(TH1D *h, Double_t blindMin, Double_t blindMax);
+    inline void DrawBlindedFunction(
+        TF1 *f, Double_t blindMin, Double_t blindMax, Option_t *option = "SAME");
 };
 
 #endif
 
 #ifdef analysis_cxx
-analysis::analysis(TTree *tree)
-    : fChain(0)
+// Il costruttore ora delega interamente il lavoro a LoadDataset
+analysis::analysis(bool isMC)
+    : fChain(nullptr)
 {
-    // if parameter tree is not specified (or zero), connect the file
-    // used to generate this class and read the Tree.
-    // if (tree == 0) {
-    //    TFile *f = (TFile*)gROOT->GetListOfFiles()->FindObject("_data/tree_M0hh_DPLUSPhiPi.root");
-    //    if (!f || !f->IsOpen()) {
-    //       f = new TFile("tree_M0hh_DPLUSPhiPi.root");
-    //    }
-    //    f->GetObject("t_M0pipi",tree);
-    // }
-    //   Init(tree);
+    LoadDataset(isMC);
+}
+
+// Distruttore aggiornato per eliminare in sicurezza la TChain
+analysis::~analysis()
+{
+    if(fChain)
+    {
+        delete fChain;
+        fChain = nullptr;
+    }
+}
+
+void analysis::LoadDataset(bool isMC)
+{
+    // Se esiste già una catena attiva, eliminala in sicurezza per liberare memoria
+    if(fChain)
+    {
+        delete fChain;
+        fChain = nullptr;
+    }
 
     TChain *chain = new TChain("t_M0pipi", "");
 
-#ifndef MC
-    chain->Add("../data/tree_data.root");
-#endif
+    if(isMC)
+    {
+        chain->Add("../mc/tree_DSPLUS_PhiPi_mc_50M.root");
+        chain->Add("../mc/tree_DPLUS_PhiPi_mc_50M.root");
+        chain->Add("../mc/tree_DSPLUS_PhiMuNu_mc_5M.root");
+        chain->Add("../mc/tree_DSPLUS_TauNu_mc_1M.root");
+        cout << "[analysis] Dataset impostato su: MONTE CARLO" << endl;
+    }
+    else
+    {
+        chain->Add("../data/tree_data.root");
+        cout << "[analysis] Dataset impostato su: DATI REALI" << endl;
+    }
 
-#ifdef MC
-    chain->Add("../mc/tree_DSPLUS_PhiPi_mc_50M.root");
-    chain->Add("../mc/tree_DPLUS_PhiPi_mc_50M.root");
-    chain->Add("../mc/tree_DSPLUS_PhiMuNu_mc_5M.root");
-    chain->Add("../mc/tree_DSPLUS_TauNu_mc_1M.root");
-#endif
-
-    tree = chain;
-    Init(tree);
-}
-
-analysis::~analysis()
-{
-    if(!fChain)
-        return;
-    delete fChain->GetCurrentFile();
+    // Esegue l'inizializzazione del nuovo albero/catena
+    Init(chain);
 }
 
 Int_t analysis::GetEntry(Long64_t entry)
@@ -429,4 +453,91 @@ void analysis::Show(Long64_t entry)
 //// returns -1 otherwise.
 //   return 1;
 //}
+
+TH1D *analysis::GetBlindedClone(TH1D *h, Double_t blindMin, Double_t blindMax)
+{
+    if(!h)
+        return nullptr;
+
+    // Crea un clone unico per evitare di sovrascrivere o alterare l'istogramma originale
+    TString cloneName = Form("%s_blinded", h->GetName());
+    TH1D *h_blind = (TH1D *)h->Clone(cloneName);
+
+    Int_t nBins = h_blind->GetNbinsX();
+    for(Int_t i = 1; i <= nBins; ++i)
+    {
+        Double_t binCenter = h_blind->GetBinCenter(i);
+        if(binCenter >= blindMin && binCenter <= blindMax)
+        {
+            h_blind->SetBinContent(i, 0.0);
+            h_blind->SetBinError(i, 0.0);
+        }
+    }
+    return h_blind;
+}
+
+void analysis::DrawBlindedFunction(TF1 *f, Double_t blindMin, Double_t blindMax, Option_t *option)
+{
+    if(!f)
+        return;
+
+    // Recupera l'intervallo di definizione originale della funzione
+    Double_t xMinOrig, xMaxOrig;
+    f->GetRange(xMinOrig, xMaxOrig);
+
+    // Disegna il primo segmento (sinistro)
+    f->SetRange(xMinOrig, blindMin);
+    f->DrawCopy(option);
+
+    // Disegna il secondo segmento (destro)
+    f->SetRange(blindMax, xMaxOrig);
+    f->DrawCopy(option);
+
+    // Ripristina l'intervallo originale sulla TF1
+    f->SetRange(xMinOrig, xMaxOrig);
+}
+
+/*
+void Blinding_test()
+{
+    // 1. Creazione di un istogramma con distribuzione gaussiana (10.000 eventi)
+    TH1D *h_test = new TH1D("h_test", "Test Blinding Visivo;X;Entries", 100, -5.0, 5.0);
+
+    TRandom3 rand(42); // Seed fisso per riproducibilità
+    for(Int_t i = 0; i < 10000; ++i)
+    {
+        h_test->Fill(rand.Gaus(0.0, 1.0)); // Genera gaussiana con media 0 e sigma 1
+    }
+
+    // 2. Definizione ed esecuzione del Fit (In modalità silenziosa, senza disegnare)
+    TF1 *f_gaus = new TF1("f_gaus", "gaus", -5.0, 5.0);
+
+    std::cout << "[INFO] Esecuzione del fit sull'istogramma completo..." << std::endl;
+    h_test->Fit(f_gaus, "Q N R"); // Q = Quiet, N = No draw, R = Use range
+
+    // 3. Definizione della regione di blinding manuale
+    Double_t blindMin = -0.8;
+    Double_t blindMax = 0.8;
+
+    // 4. Fase di plotting: Creazione del Canvas
+    TCanvas *c_test = new TCanvas("c_test", "Test Blinding Canvas", 800, 600);
+    c_test->cd();
+
+    // Utilizzo dell'Helper 1 per ottenere l'istogramma modificato e disegnarlo
+    TH1D *h_visual = GetBlindedClone(h_test, blindMin, blindMax);
+    h_visual->SetMarkerStyle(20);
+    h_visual->SetMarkerSize(0.8);
+    h_visual->SetLineColor(kBlack);
+    h_visual->Draw("E");
+
+    // Utilizzo dell'Helper 2 per disegnare la funzione di fit con il vuoto al centro
+    f_gaus->SetLineColor(kRed);
+    f_gaus->SetLineWidth(3);
+    DrawBlindedFunction(f_gaus, blindMin, blindMax, "SAME");
+
+    std::cout << "[SUCCESS] Test completato. La regione [" << blindMin << ", " << blindMax
+              << "] e' stata oscurata sul plot." << std::endl;
+}
+ */
+
 #endif // #ifdef analysis_cxx
