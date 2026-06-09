@@ -342,16 +342,12 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
 {
     AuxFitResult res;
 
-    // 1. Controllo iniziale sui possibili mcID ammessi
     if(mcID != 34 && mcID != 41 && mcID != 42 && mcID != 44)
     {
         cout << "[ERROR] Invalid mcID = " << mcID << ". Allowed IDs are: 34, 41, 42, 44." << endl;
         return res;
     }
 
-    SetLBStyle();
-
-    // Controllo di sicurezza sulla validità della TChain
     if(!fChain)
     {
         cout << "[ERROR] fChain is null!" << endl;
@@ -364,6 +360,15 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
         cout << "[WARNING] No entries found in fChain!" << endl;
         return res;
     }
+
+    // 1. ALLOCHIAMO SUBITO IL CANVAS CORRETTO (Evita i crash grafici interni di ROOT durante GetEntry)
+    SetLBStyle();
+    
+    // --- MODIFICA 1: Sovrascriviamo le impostazioni dello stile globale per abilitare la Box ---
+    gStyle->SetOptFit(1111); // Forza la comparsa di: Chi2/ndf, Parametri, Errori, Status
+
+    TCanvas *cMass = new TCanvas(Form("cMass_%d", mcID), Form("Mass Fit MC %d", mcID), 800, 600);
+    cMass->cd();
 
     std::vector<Double_t> mass_vals;
     mass_vals.reserve(static_cast<size_t>(nentries));
@@ -386,45 +391,49 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
         return res;
     }
 
-    // Calcolo della media e del RMS dei dati reali
+    // ... [Il codice intermedio di calcolo di meanInit, rmsInit, xMin, xMax rimane identico] ...
     Double_t sum = 0.0;
-    for(double m : mass_vals)
-        sum += m;
+    for(double m : mass_vals) sum += m;
     Double_t meanInit = sum / mass_vals.size();
 
     Double_t sum_sq = 0.0;
-    for(double m : mass_vals)
-        sum_sq += (m - meanInit) * (m - meanInit);
+    for(double m : mass_vals) sum_sq += (m - meanInit) * (m - meanInit);
     Double_t rmsInit = std::sqrt(sum_sq / mass_vals.size());
 
-    // Definizione della larghezza fissa del bin (5e-4 = 0.0005 GeV)
     const Double_t binWidthTarget = 5e-4;
     Double_t halfRange = 4.0 * rmsInit;
 
-    // Allineamento degli estremi
     Double_t xMin = std::floor((meanInit - halfRange) / binWidthTarget) * binWidthTarget;
     Double_t xMax = std::ceil((meanInit + halfRange) / binWidthTarget) * binWidthTarget;
 
     Int_t nBins = std::round((xMax - xMin) / binWidthTarget);
-    if(nBins <= 0)
-        nBins = 1;
+    if(nBins <= 0) nBins = 1;
 
-    // Creazione dell'istogramma
-    auto h_mass = new TH1D("h_mass", "mass", nBins, xMin, xMax);
-    for(double m : mass_vals)
-    {
-        h_mass->Fill(m);
-    }
+    auto h_mass = new TH1D(Form("h_mass_MC_%d", mcID), "mass", nBins, xMin, xMax);
+    h_mass->SetDirectory(nullptr);
+
+    for(double m : mass_vals) h_mass->Fill(m);
 
     Double_t binWidth = h_mass->GetBinWidth(1);
     TFitResultPtr r;
 
-    // BIVIO DI FIT IN BASE ALL'MCID
+    cMass->cd();
+    AddBinSizeOnYTitle(h_mass, "GeV/#it{c}^{2}");
+    
+    TString particleName = "";
+    if (mcID == 34)      particleName = "D^{+} #rightarrow #phi#pi^{+}";
+    else if (mcID == 41) particleName = "D_{s}^{+} #rightarrow #phi#pi^{+}";
+    else if (mcID == 42) particleName = "D_{s}^{+} #rightarrow #phi#mu^{+}#nu_{#mu}";
+    else if (mcID == 44) particleName = "D_{s}^{+} #rightarrow #tau^{+}#nu_{#tau}";
+    
+    h_mass->GetXaxis()->SetTitle(Form("M(%s) [GeV/#it{c}^{2}]", particleName.Data()));
+    
+    // --- MODIFICA 2: Diciamo esplicitamente all'istogramma che VOGLIAMO le statistiche ---
+    h_mass->SetStats(kTRUE);
+
     if(mcID != 42)
     {
-        // --- FIT DOPPIA GAUSSIANA (ID: 34, 41, 44) ---
-        TF1 *fFitMass = new TF1("fFitMass", f_2G_Frac, xMin, xMax, 5);
-
+        TF1 *fFitMass = new TF1(Form("fFitMass_%d", mcID), f_2G_Frac, xMin, xMax, 5);
         Double_t yieldInit = h_mass->GetEntries() * binWidth;
 
         fFitMass->SetParameters(yieldInit, meanInit, rmsInit * 0.5, rmsInit * 1.5, 0.7);
@@ -435,20 +444,37 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
         fFitMass->SetParLimits(3, 0.0, rmsInit * 3.0);
         fFitMass->SetParLimits(4, 0.0, 1.0);
 
-        TCanvas *cMass = new TCanvas("cMass", "Mass Fit MC Double Gaus", 800, 600);
-        cMass->cd();
-        AddBinSizeOnYTitle(h_mass, "GeV/#it{c}^{2}");
-
         cout << "\n--- Fitting Mass for MC (ID: " << mcID << ") with Double Gaussian ---" << endl;
-        r = h_mass->Fit(fFitMass, "L I R S Q");
-
+        
+        // 1. Disegna PRIMA per allocare la grafica
         h_mass->Draw("E");
+        
+        // 2. Fai il Fit
+        r = h_mass->Fit(fFitMass, "L I R S Q");
+        
+        // 3. Genera la stat box in memoria
+        cMass->Modified();
+        cMass->Update();
+        
+        // 4. Trova la box e spostala
+        TPaveStats *st = (TPaveStats*)h_mass->FindObject("stats");
+        if(st) {
+            st->SetOptFit(1111);
+            
+            st->SetX1NDC(0.653); // Bordo sinistro
+            st->SetY1NDC(0.652); // Bordo inferiore
+            st->SetX2NDC(0.962); // Bordo destro
+            st->SetY2NDC(0.972); // Bordo superiore
+        } else {
+            cout << "[WARNING] Impossibile trovare la stat box!" << endl;
+        }
+        
+        // 5. Disegna solo le funzioni. L'istogramma è GIÀ disegnato.
         fFitMass->SetLineWidth(3);
         fFitMass->SetLineColor(kRed);
         fFitMass->Draw("SAME");
 
-        // Componente 1 (Verde)
-        TF1 *g1 = new TF1("g1", "gausn", xMin, xMax);
+        TF1 *g1 = new TF1(Form("g1_%d", mcID), "gausn", xMin, xMax);
         g1->SetParameters(fFitMass->GetParameter(0) * fFitMass->GetParameter(4),
             fFitMass->GetParameter(1), fFitMass->GetParameter(2));
         g1->SetLineColor(kGreen + 2);
@@ -456,8 +482,7 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
         g1->SetLineWidth(2);
         g1->Draw("SAME");
 
-        // Componente 2 (Blu)
-        TF1 *g2 = new TF1("g2", "gausn", xMin, xMax);
+        TF1 *g2 = new TF1(Form("g2_%d", mcID), "gausn", xMin, xMax);
         g2->SetParameters(fFitMass->GetParameter(0) * (1.0 - fFitMass->GetParameter(4)),
             fFitMass->GetParameter(1), fFitMass->GetParameter(3));
         g2->SetLineColor(kBlue);
@@ -467,51 +492,55 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
     }
     else
     {
-        // --- FIT ARGUS (ID: 42) ---
         Double_t L_taumass_range = 1.6;
         Double_t H_taumass_range = 2.0;
 
         ArgusPDF argus_func(L_taumass_range, H_taumass_range, binWidth);
-
-        TF1 *fFitMass = new TF1("fFitMass", argus_func, L_taumass_range, H_taumass_range, 4);
-
-        // Stima dei parametri iniziali per ARGUS
-        Double_t yieldInit = h_mass->GetEntries(); // Numero di eventi totali nell'istogramma
-
-        // Trova il valore massimo osservato nei dati per impostare il cutoff m0
-        Double_t maxMassObserved = xMin;
-        for(double m : mass_vals)
-        {
-            if(m > maxMassObserved)
-                maxMassObserved = m;
-        }
-        Double_t m0Init
-            = maxMassObserved + 0.001; // Inizializzato leggermente sopra il massimo osservato
+        TF1 *fFitMass = new TF1(Form("fFitMass_%d", mcID), argus_func, L_taumass_range, H_taumass_range, 4);
 
         fFitMass->SetParameters(95200, 1.978, -3.84, 1.417);
         fFitMass->SetParNames("Yield", "m_{0}", "c", "p");
 
-        // Limiti per evitare divergenze numeriche
-        // fFitMass->SetParLimits(0, 0.0, yieldInit * 2.0);
-        // fFitMass->SetParLimits(1, maxMassObserved,
-        //     xMax * 1.1); // m0 deve essere maggiore della massa massima osservata
-        // fFitMass->SetParLimits(2, -100.0, -0.1); // pendenza c solitamente negativa
-        // fFitMass->SetParLimits(3, 0.1, 2.0); // esponente tipicamente attorno a 0.5
-
-        TCanvas *cMass = new TCanvas("cMass", "Mass Fit MC ARGUS", 800, 600);
-        cMass->cd();
-        AddBinSizeOnYTitle(h_mass, "GeV/#it{c}^{2}");
-
         cout << "\n--- Fitting Mass for MC (ID: " << mcID << ") with ARGUS ---" << endl;
+        
+        // 1. Disegna PRIMA per allocare la struttura grafica sul Canvas
+        h_mass->Draw("E");
+        
+        // 2. Fai il Fit
         r = h_mass->Fit(fFitMass, "L I R S Q");
 
-        h_mass->Draw("E");
+        // 3. AGGIORNA IL CANVAS (Questo passaggio mancava e generava un puntatore nullo su 'stats')
+        cMass->Modified();
+        cMass->Update();
+
+        // 4. Ora che è in memoria, estrai e sposta il pannello
+        TPaveStats *st = (TPaveStats*)h_mass->FindObject("stats");
+        if(st) {
+            st->SetOptFit(1111);
+            
+            st->SetX1NDC(0.199); // Bordo sinistro
+            st->SetY1NDC(0.195); // Bordo inferiore
+            st->SetX2NDC(0.560); // Bordo destro
+            st->SetY2NDC(0.475); // Bordo superiore
+        } else {
+            cout << "[WARNING] Impossibile trovare la stat box per ARGUS!" << endl;
+        }
+        
+        // 5. Disegna la linea di Fit sopra l'istogramma esistente
         fFitMass->SetLineWidth(3);
         fFitMass->SetLineColor(kRed);
         fFitMass->Draw("SAME");
     }
+    
+    // Un ultimo refresh globale prima del salvataggio definitivo
+    cMass->Modified();
+    cMass->Update();
 
-    // Estrazione dei risultati nella struct
+    if (savePlots) {
+        cMass->Print(Form("./_fig/FitMass_MC_%d.pdf", mcID));
+        cMass->Print(Form("./_fig/FitMass_MC_%d.root", mcID));
+    }
+    
     if(r.Get())
     {
         res.isValid = r->IsValid();
@@ -540,17 +569,19 @@ AuxFitResult analysis::FitCombinatorialBkg()
 {
     AuxFitResult res;
     SetLBStyle();
+    
+    // --- MODIFICA 1: Abilitiamo lo stile globale per il pannello delle statistiche ---
+    gStyle->SetOptFit(1111);
 
-    // 1. Forza il caricamento dei dati reali (isMC = false / 0)
     LoadDataset(0);
 
     Double_t xMin = 2.0;
     Double_t xMax = 2.09;
 
-    auto h_mass = new TH1D("h_mass", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
+    auto h_mass = new TH1D("h_mass_bkg", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
+    h_mass->SetDirectory(nullptr);
     AddBinSizeOnYTitle(h_mass, "GeV/#it{c}^{2}");
 
-    // Riempimento dell'istogramma
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
         if(LoadTree(jentry) < 0)
@@ -568,50 +599,76 @@ AuxFitResult analysis::FitCombinatorialBkg()
 
     Double_t binWidth = h_mass->GetBinWidth(1);
 
-    // 2. Creazione del Functor e del TF1 (solo 2 parametri fisici)
     Pol1PDF pol1_func(xMin, xMax, binWidth);
-
     TF1 *f_pol1 = new TF1("f_pol1", pol1_func, xMin, xMax, 2);
 
     Double_t yieldInit = h_mass->GetEntries();
-    // Double_t range = xMax - xMin;
-
     f_pol1->SetParameters(yieldInit, 0.0);
     f_pol1->SetParNames("Yield", "Slope");
 
-    // Limiti di sicurezza per il fit
-    // f_pol1->SetParLimits(0, 0.1, yieldInit * 5.0);
-
-    // Limite matematico sulla pendenza: |Slope| < 2 / Range per evitare valori negativi
-    // Double_t slopeLimit = 1.99 / range;
-    // f_pol1->SetParLimits(1, -slopeLimit, slopeLimit);
-
-    // Esecuzione del Fit
     cout << "\n--- Fitting Combinatorial Background with Pol1PDF Functor ---" << endl;
-    TFitResultPtr r = h_mass->Fit(f_pol1, "L I R S N Q");
+    
+    // --- MODIFICA 2: Rimosse opzione "N" per permettere a ROOT di salvare i dati del fit nell'istogramma ---
+    TFitResultPtr r = h_mass->Fit(f_pol1, "L I R S Q");
 
-    // 3. Fase di Blinding visivo (Plotting)
     Double_t blindMin = 1.777 - 3 * 0.0058;
     Double_t blindMax = 1.777 + 3 * 0.0058;
 
     TCanvas *c_bkg = new TCanvas("c_bkg", "Combinatorial Background Fit", 800, 600);
     c_bkg->cd();
 
-    if(blindMin > xMin && blindMax < xMax)
-    {
-        TH1D *h_mass_blind = analysis::GetBlindedClone(h_mass, blindMin, blindMax);
-        h_mass_blind->Draw("E");
+    // --- MODIFICA 3: Riorganizzazione della logica di disegno e gestione unificata della Stat Box ---
+    TH1D *h_to_draw = h_mass;
+    bool isBlinded = (blindMin > xMin && blindMax < xMax);
 
-        f_pol1->SetLineColor(kRed);
-        f_pol1->SetLineWidth(3);
+    if(isBlinded)
+    {
+        // Se siamo nel range di blinding, creiamo il clone oscurato
+        h_to_draw = analysis::GetBlindedClone(h_mass, blindMin, blindMax);
+    }
+
+    // Diciamo all'istogramma (normale o blindato) di mostrare le statistiche e lo disegnamo
+    h_to_draw->SetStats(kTRUE);
+    h_to_draw->SetMinimum(0.0);
+    h_to_draw->SetMaximum(80.0);
+    h_to_draw->Draw("E");
+
+    // Forza ROOT a generare la stat box in memoria prima di cercarla
+    c_bkg->Modified();
+    c_bkg->Update();
+
+    // Cerchiamo la box direttamente dall'istogramma appena disegnato
+    TPaveStats *st = (TPaveStats*)h_to_draw->FindObject("stats");
+    if(st) {
+        st->SetOptFit(1111);
+        st->SetX1NDC(0.653); // Bordo sinistro
+        st->SetY1NDC(0.734); // Bordo inferiore
+        st->SetX2NDC(0.961); // Bordo destro
+        st->SetY2NDC(0.972); // Bordo superiore
+        // Sotto inteso: NESSUN st->Draw() per evitare il bug del PDF vuoto!
+    } else {
+        cout << "[WARNING] Impossibile trovare la stat box del background!" << endl;
+    }
+
+    // Ora disegnamo la funzione sopra l'istogramma
+    f_pol1->SetLineColor(kRed);
+    f_pol1->SetLineWidth(3);
+    if(isBlinded)
+    {
         analysis::DrawBlindedFunction(f_pol1, blindMin, blindMax, "SAME");
     }
     else
     {
-        h_mass->Draw("E");
-        f_pol1->SetLineColor(kRed);
-        f_pol1->SetLineWidth(3);
         f_pol1->Draw("SAME");
+    }
+    
+    // Refresh finale della grafica per incorporare il posizionamento della box
+    c_bkg->Modified();
+    c_bkg->Update();
+
+    if (savePlots) {
+        c_bkg->Print("./_fig/FitCombinatorialBkg.pdf");
+        c_bkg->Print("./_fig/FitCombinatorialBkg.root");
     }
 
     if(r.Get())
@@ -672,8 +729,9 @@ void analysis::DoFullBlindedUnbinnedFit()
     g_data_events.reserve(static_cast<size_t>(nentries));
 
     // Istogramma binned per la sola visualizzazione finale
-    auto h_mass = new TH1D("h_mass", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
-
+    auto h_mass = new TH1D("h_mass_unbinned", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
+    h_mass->SetDirectory(nullptr);
+    
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
         if(LoadTree(jentry) < 0)
@@ -768,12 +826,18 @@ void analysis::DoFullBlindedUnbinnedFit()
     TF1 *f_draw = new TF1("f_draw", scale_pdf_lambda, xMin, xMax, 4);
     f_draw->SetParameters(
         minimizer->X()[0], minimizer->X()[1], minimizer->X()[2], minimizer->X()[3]);
+    f_draw->SetNpx(10000);
     f_draw->SetLineColor(kRed);
     f_draw->SetLineWidth(3);
 
     // Disegniamo la curva con il vuoto al centro
     analysis::DrawBlindedFunction(f_draw, blindMin, blindMax, "SAME");
 
+    if (savePlots) {
+        c_unbinned->Print("./_fig/FitFullUnbinned.pdf");
+        c_unbinned->Print("./_fig/FitFullUnbinned.root");
+    }
+    
     // Pulizia della memoria - NOTA: g_pdf_unbinned NON deve essere deallocata qui
     // perché la lambda in f_draw la riferisce ancora!
     delete minimizer;
