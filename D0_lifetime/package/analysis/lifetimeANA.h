@@ -49,6 +49,13 @@ struct AuxFitResult
     }
 };
 
+// Struct per restituire f_bkg e il suo errore dal fit di massa
+struct FbkgResult
+{
+    Double_t fbkg;
+    Double_t fbkg_error;
+};
+
 class lifetimeANA
 {
   public:
@@ -233,14 +240,15 @@ class lifetimeANA
     AuxFitResult FitAcceptancePs(UInt_t seed = 0);
     void RunGlobalFit();
     void RunManualUnbinnedFit();
-    void RunDataFitFixed();
-    void RunDataFitProfiled();
+    void RunDataFitSimpleBinned(Double_t minT = 0.3);
+    void RunDataFitFixed(Double_t minT = 0.3);
+    void RunDataFitProfiled(Double_t minT = 0.3);
 
     // Background
     AuxFitResult MassRegions();
     // Background studies
     void FitMassMC();
-    void FitMassData();
+    FbkgResult FitMassData(Double_t minT = 0.);
 };
 
 #endif
