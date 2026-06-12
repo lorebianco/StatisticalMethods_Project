@@ -236,8 +236,9 @@ class analysis
 
     // User functions
     AuxFitResult FitTemplateMass(Int_t mcID);
-    AuxFitResult FitCombinatorialBkg();
+    AuxFitResult FitCombinatorialBkg(bool usePol1 = false);
     void DoFullBlindedUnbinnedFit();
+    void RunToyMC(int nToys = 1e9);
 
     // Helpers for blind analysis
     inline TH1D *GetBlindedClone(TH1D *h, Double_t blindMin, Double_t blindMax);
