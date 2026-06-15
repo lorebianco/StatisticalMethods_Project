@@ -1,21 +1,29 @@
+#include "RtypesCore.h"
 #define analysis_cxx
+#include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <thread>
+#include <vector>
 
 #include <Math/Factory.h>
 #include <Math/Functor.h>
 #include <Math/Minimizer.h>
 #include <Math/SpecFuncMathCore.h>
+#include <TAxis.h>
 #include <TCanvas.h>
 #include <TF1.h>
 #include <TFitResult.h>
 #include <TFitResultPtr.h>
+#include <TGraph.h>
+#include <TGraphErrors.h>
 #include <TH2.h>
 #include <TLegend.h>
+#include <TLine.h>
 #include <TMath.h>
 #include <TMatrixDSym.h>
 #include <TPaveStats.h>
@@ -31,6 +39,7 @@ using namespace TMath;
 using namespace lbStyle;
 
 constexpr Bool_t savePlots = false;
+constexpr UInt_t THE_SEED = 0;
 
 // pdf = f_s p(s) + (1-f_s) * (f_1 * p_1 + f_2 * p_2 + f_3 * p_3 + (1 - f_1 - f_2 - f_3) * p_4)
 
@@ -175,7 +184,7 @@ class Pol1PDF
 
 class FullUnbinnedPDF
 {
-  public: // Membri pubblici per compatibilità con il plotting esistente
+  public:
     double m_xMin, m_xMax;
     double m_sig_mean, m_sig_sigma1, m_sig_sigma2, m_sig_frac1;
     double m_p1_mean, m_p1_sigma1, m_p1_sigma2, m_p1_frac1;
@@ -183,122 +192,11 @@ class FullUnbinnedPDF
     double m_argus_m0, m_argus_c, m_argus_p;
     bool m_usePol1Bkg;
 
-  private:
-    // --- VARIABILI DI CACHE ---
-    mutable std::vector<double> m_last_pars; // Memorizza gli ultimi parametri valutati
-
-    // Costanti di normalizzazione pre-calcolate
-    mutable double m_norm_argus;
-    mutable double m_norm_expo;
-    mutable double m_norm_pol1;
-    mutable double m_norm_sig_g1, m_norm_sig_g2;
-    mutable double m_norm_p1_g1, m_norm_p1_g2;
-    mutable double m_norm_p2_g1, m_norm_p2_g2;
-
-    // Metodo privato per aggiornare le normalizzazioni (chiamato solo al cambio dei parametri)
-    void UpdateNormalizations(const double *par) const
-    {
-        const double slope = par[4];
-
-        // Normalizzazione Esponenziale
-        if(std::abs(slope) < 1e-6)
-        {
-            m_norm_expo = m_xMax - m_xMin;
-        }
-        else
-        {
-            m_norm_expo = (std::exp(slope * m_xMax) - std::exp(slope * m_xMin)) / slope;
-        }
-
-        // Normalizzazione Pol1
-        m_norm_pol1 = m_xMax - m_xMin;
-
-        // Prefattori Gaussiane: 1 / (sigma * sqrt(2*pi))
-        m_norm_sig_g1 = 1.0 / (par[6] * std::sqrt(2.0 * M_PI));
-        m_norm_sig_g2 = 1.0 / (par[7] * std::sqrt(2.0 * M_PI));
-
-        m_norm_p1_g1 = 1.0 / (par[10] * std::sqrt(2.0 * M_PI));
-        m_norm_p1_g2 = 1.0 / (par[11] * std::sqrt(2.0 * M_PI));
-
-        m_norm_p2_g1 = 1.0 / (par[14] * std::sqrt(2.0 * M_PI));
-        m_norm_p2_g2 = 1.0 / (par[15] * std::sqrt(2.0 * M_PI));
-
-        // Normalizzazione dell'Argus (Molto costosa)
-        const double m0 = par[17];
-        const double c = par[18];
-        const double p = par[19];
-
-        double xL = 1.0 - (m_xMin / m0) * (m_xMin / m0);
-        double xH = 1.0 - (m_xMax / m0) * (m_xMax / m0);
-        double gammaA = ROOT::Math::tgamma(1.0 + p);
-        double dL = gammaA * ROOT::Math::inc_gamma_c(1.0 + p, -c * xL);
-        double dH = gammaA * ROOT::Math::inc_gamma_c(1.0 + p, -c * xH);
-        m_norm_argus = (m0 * m0) / (2.0 * c * std::pow(-c, p)) * (dL - dH);
-    }
-
-    // Controlla se i parametri del fit sono cambiati rispetto all'ultimo evento valutato
-    bool ParametersChanged(const double *par) const
-    {
-        if(m_last_pars.size() < 20)
-            return true;
-        for(int i = 0; i < 20; ++i)
-        {
-            if(std::abs(par[i] - m_last_pars[i]) > 1e-12)
-                return true;
-        }
-        return false;
-    }
-
-    // Metodi interni veloci che sfruttano la cache
-    double Eval2G_Cached(double x, double mean, double s1, double s2, double f1, double norm_g1,
-        double norm_g2) const
-    {
-        double dx1 = (x - mean) / s1;
-        double dx2 = (x - mean) / s2;
-        double g1 = std::exp(-0.5 * dx1 * dx1) * norm_g1;
-        double g2 = std::exp(-0.5 * dx2 * dx2) * norm_g2;
-        return f1 * g1 + (1.0 - f1) * g2;
-    }
-
-    double EvalArgus_Cached(double x, double m0, double c, double p) const
-    {
-        if(x >= m0 || m_norm_argus <= 0.0)
-            return 0.0;
-        double u = 1.0 - (x / m0) * (x / m0);
-        return x * std::pow(u, p) * std::exp(c * u) / m_norm_argus;
-    }
-
-    double EvalExpo_Cached(double x, double slope) const
-    {
-        if(m_norm_expo <= 0.0)
-            return 0.0;
-        return std::exp(slope * x) / m_norm_expo;
-    }
-
-    double EvalPol1_Cached(double x, double slope) const
-    {
-        if(m_norm_pol1 <= 0.0)
-            return 0.0;
-        double xMid = 0.5 * (m_xMin + m_xMax);
-        return (1.0 / m_norm_pol1) * (1.0 + slope * (x - xMid));
-    }
-
-  public:
     FullUnbinnedPDF(double xMin, double xMax, const AuxFitResult &sigRes, const AuxFitResult &p1Res,
-        const AuxFitResult &p2Res, const AuxFitResult &argusRes, const AuxFitResult &expo1Res,
-        bool usePol1Bkg = false)
+        const AuxFitResult &p2Res, const AuxFitResult &argusRes, bool usePol1Bkg = false)
         : m_xMin(xMin)
         , m_xMax(xMax)
         , m_usePol1Bkg(usePol1Bkg)
-        , m_norm_argus(1.0)
-        , m_norm_expo(1.0)
-        , m_norm_pol1(1.0)
-        , m_norm_sig_g1(1.0)
-        , m_norm_sig_g2(1.0)
-        , m_norm_p1_g1(1.0)
-        , m_norm_p1_g2(1.0)
-        , m_norm_p2_g1(1.0)
-        , m_norm_p2_g2(1.0)
     {
         m_sig_mean = sigRes.params[1];
         m_sig_sigma1 = sigRes.params[2];
@@ -320,14 +218,27 @@ class FullUnbinnedPDF
         m_argus_p = argusRes.params[3];
     }
 
-    // Manteniamo le funzioni di Eval pubbliche e non-cached originali
-    // per non rompere i puntatori o le lambda usate nel plotting
+    // Calcolo esatto dell'integrale della gaussiana tra xMin e xMax
+    double NormGaussian(double mean, double sigma) const
+    {
+        double zMin = (m_xMin - mean) / (sigma * M_SQRT2);
+        double zMax = (m_xMax - mean) / (sigma * M_SQRT2);
+        return 0.5 * (std::erf(zMax) - std::erf(zMin));
+    }
+
     double Eval2G(double x, double mean, double s1, double s2, double f1) const
     {
+        // Ottieni la normalizzazione esatta
+        double norm1 = NormGaussian(mean, s1);
+        double norm2 = NormGaussian(mean, s2);
+
         double dx1 = (x - mean) / s1;
         double dx2 = (x - mean) / s2;
-        double g1 = std::exp(-0.5 * dx1 * dx1) / (s1 * std::sqrt(2.0 * M_PI));
-        double g2 = std::exp(-0.5 * dx2 * dx2) / (s2 * std::sqrt(2.0 * M_PI));
+
+        // Dividi per la normalizzazione di range oltre a quella standard
+        double g1 = std::exp(-0.5 * dx1 * dx1) / (s1 * std::sqrt(2.0 * M_PI) * norm1);
+        double g2 = std::exp(-0.5 * dx2 * dx2) / (s2 * std::sqrt(2.0 * M_PI) * norm2);
+
         return f1 * g1 + (1.0 - f1) * g2;
     }
 
@@ -335,37 +246,29 @@ class FullUnbinnedPDF
     {
         if(x >= m0)
             return 0.0;
+
         double xL = 1.0 - (m_xMin / m0) * (m_xMin / m0);
         double xH = 1.0 - (m_xMax / m0) * (m_xMax / m0);
+
         double gammaA = ROOT::Math::tgamma(1.0 + p);
         double dL = gammaA * ROOT::Math::inc_gamma_c(1.0 + p, -c * xL);
         double dH = gammaA * ROOT::Math::inc_gamma_c(1.0 + p, -c * xH);
+
         double norm = (m0 * m0) / (2.0 * c * std::pow(-c, p)) * (dL - dH);
+
         double u = 1.0 - (x / m0) * (x / m0);
         return x * std::pow(u, p) * std::exp(c * u) / norm;
     }
 
     double EvalExpo(double x, double slope) const
     {
-        double norm = 0.0;
-        if(std::abs(slope) < 1e-6)
-        {
-            norm = m_xMax - m_xMin;
-        }
-        else
-        {
-            norm = (std::exp(slope * m_xMax) - std::exp(slope * m_xMin)) / slope;
-        }
-        if(norm <= 0.0)
-            return 0.0;
+        double norm = (std::exp(slope * m_xMax) - std::exp(slope * m_xMin)) / slope;
         return std::exp(slope * x) / norm;
     }
 
     double EvalPol1(double x, double slope) const
     {
         double range = m_xMax - m_xMin;
-        if(range <= 0.0)
-            return 0.0;
         double xMid = 0.5 * (m_xMin + m_xMax);
         return (1.0 / range) * (1.0 + slope * (x - xMid));
     }
@@ -373,14 +276,6 @@ class FullUnbinnedPDF
     // --- OPERATORE CHIAMATO DA MINUIT ---
     double operator()(const double *x, const double *par) const
     {
-        // Se i parametri correnti sono diversi da quelli dell'ultima iterazione,
-        // ricalcoliamo le costanti di normalizzazione (una sola volta per step!)
-        if(ParametersChanged(par))
-        {
-            UpdateNormalizations(par);
-            m_last_pars.assign(par, par + 20);
-        }
-
         const double xx = x[0];
         const double f_s = par[0];
         const double f_1 = par[1];
@@ -388,18 +283,16 @@ class FullUnbinnedPDF
         const double f_3 = par[3];
         const double slope = par[4];
 
-        // Valutazione ad altissima velocità tramite le funzioni cached
-        double p_sig
-            = Eval2G_Cached(xx, par[5], par[6], par[7], par[8], m_norm_sig_g1, m_norm_sig_g2);
-        double p_1
-            = Eval2G_Cached(xx, par[9], par[10], par[11], par[12], m_norm_p1_g1, m_norm_p1_g2);
-        double p_2
-            = Eval2G_Cached(xx, par[13], par[14], par[15], par[16], m_norm_p2_g1, m_norm_p2_g2);
-        double p_3 = EvalArgus_Cached(xx, par[17], par[18], par[19]);
-        double p_4 = m_usePol1Bkg ? EvalPol1_Cached(xx, slope) : EvalExpo_Cached(xx, slope);
+        double p_sig = Eval2G(xx, par[5], par[6], par[7], par[8]);
+        double p_1 = Eval2G(xx, par[9], par[10], par[11], par[12]);
+        double p_2 = Eval2G(xx, par[13], par[14], par[15], par[16]);
+        double p_3 = EvalArgus(xx, par[17], par[18], par[19]);
+        double p_4 = m_usePol1Bkg ? EvalPol1(xx, slope) : EvalExpo(xx, slope);
 
         double p_bkg = f_1 * p_1 + f_2 * p_2 + f_3 * p_3 + (1.0 - f_1 - f_2 - f_3) * p_4;
-        return f_s * p_sig + (1.0 - f_s) * p_bkg;
+
+        double pdf_val = f_s * p_sig + (1.0 - f_s) * p_bkg;
+        return pdf_val;
     }
 };
 
@@ -407,18 +300,65 @@ class FullUnbinnedPDF
 thread_local std::vector<double> g_data_events;
 thread_local FullUnbinnedPDF *g_pdf_unbinned = nullptr;
 
-double Unbinned2NLL(const double *par)
+inline double Unbinned2NLL(const double *par)
 {
     double nll = 0.0;
     for(int i = 0; i < (int)g_data_events.size(); i++)
     {
         double x = g_data_events[i];
         double val = (*g_pdf_unbinned)(&x, par);
-        // if(!std::isfinite(val) || val <= 0.0)
-        //     val = 1e-10;
+
         nll -= std::log(val);
     }
     return 2.0 * nll;
+}
+
+/*
+    // --- Likelihood ratio ordering
+    inline Double_t LROrdering(Double_t *x, Double_t *par)
+    {
+    double xx = x[0];
+    double mu = par[0];
+    double sigma = par[1];
+
+    if(xx >= 0)
+        return exp(-0.5 * (xx - mu) * (xx - mu) / (sigma * sigma));
+    else
+        return exp(
+            (-0.5 * (xx - mu) * (xx - mu) / (sigma * sigma)) + 0.5 * (xx * xx) / (sigma * sigma));
+}
+*/
+
+// --- Likelihood ratio ordering (Feldman-Cousins con sigma dinamica)
+inline Double_t LROrdering(Double_t *x, Double_t *par)
+{
+    double xx = x[0];
+    double mu = par[0];
+    double sigma0 = par[1];
+    double alpha = par[2];
+
+    // Calcolo la sigma per l'ipotesi mu (numeratore)
+    double sigma_mu = sigma0 + alpha * mu;
+
+    // Calcolo il best-fit e la sua rispettiva sigma (denominatore)
+    double mu_best = std::max(0.0, xx); // Limite fisico: mu_best >= 0
+    double sigma_best = sigma0 + alpha * mu_best;
+
+    // Prefattore matematico derivante dal rapporto 1/sigma_mu diviso 1/sigma_best
+    double prefactor = sigma_best / sigma_mu;
+
+    if(xx >= 0)
+    {
+        // Se xx >= 0, allora mu_best = xx. Il termine esponenziale al denominatore è exp(0) = 1.
+        return prefactor * exp(-0.5 * (xx - mu) * (xx - mu) / (sigma_mu * sigma_mu));
+    }
+    else
+    {
+        // Se xx < 0, allora mu_best = 0. Il denominatore ha un esponenziale valutato in 0.
+        return prefactor
+            * exp((-0.5 * (xx - mu) * (xx - mu) / (sigma_mu * sigma_mu))
+                + (0.5 * (xx * xx) / (sigma_best * sigma_best)));
+    }
 }
 
 // ========================================================================
@@ -506,8 +446,8 @@ void analysis::Loop()
     histo_D_pt_S->Draw("same");
 
     // Save canvas in .pdf and .epr format
-    c_histo_D_M->Print("./_fig/c_histo.pdf");
-    c_histo_D_M->Print("./_fig/c_histo.eps");
+    c_histo_D_M->SaveAs("./_fig/c_histo.pdf");
+    c_histo_D_M->SaveAs("./_fig/c_histo.eps");
 
     // Create a new file to store histograms
     TFile *histo_file = new TFile("./_root/histo_file.root", "RECREATE", "put a title");
@@ -623,13 +563,13 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
 
     TString particleName = "";
     if(mcID == 34)
-        particleName = "D^{+} #rightarrow #phi#pi^{+}";
+        particleName = "D^{+}#rightarrow#phi#pi^{+}";
     else if(mcID == 41)
-        particleName = "D_{s}^{+} #rightarrow #phi#pi^{+}";
+        particleName = "D_{s}^{+}#rightarrow#phi#pi^{+}";
     else if(mcID == 42)
-        particleName = "D_{s}^{+} #rightarrow #phi#mu^{+}#nu_{#mu}";
+        particleName = "D_{s}^{+}#rightarrow#phi#mu^{+}#nu_{#mu}";
     else if(mcID == 44)
-        particleName = "D_{s}^{+} #rightarrow #tau^{+}#nu_{#tau}";
+        particleName = "D_{s}^{+}#rightarrow#tau^{+}#nu_{#tau}";
 
     h_mass->GetXaxis()->SetTitle(Form("M(%s) [GeV/#it{c}^{2}]", particleName.Data()));
 
@@ -750,8 +690,8 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
 
     if(savePlots)
     {
-        cMass->Print(Form("./_fig/FitMass_MC_%d.pdf", mcID));
-        cMass->Print(Form("./_fig/FitMass_MC_%d.root", mcID));
+        cMass->SaveAs(Form("./_fig/FitMass_MC_%d.pdf", mcID));
+        cMass->SaveAs(Form("./_root/FitMass_MC_%d.root", mcID));
     }
 
     if(r.Get())
@@ -880,8 +820,8 @@ AuxFitResult analysis::FitCombinatorialBkg(bool usePol1)
 
     if(savePlots)
     {
-        c_bkg->Print("./_fig/FitCombinatorialBkg.pdf");
-        c_bkg->Print("./_fig/FitCombinatorialBkg.root");
+        c_bkg->SaveAs("./_fig/FitCombinatorialBkg.pdf");
+        c_bkg->SaveAs("./_root/FitCombinatorialBkg.root");
     }
 
     if(r.Get())
@@ -922,25 +862,21 @@ void analysis::DoFullBlindedUnbinnedFit()
     constexpr bool floatArgusShape = false; // Leave it false
 
     // 1. Esecuzione dei fit ausiliari (MC e fondo combinatorio)
-    cout << "\n=== [STEP 1/3] Running MC Auxiliary Fits ===" << endl;
+    cout << "\n=== [STEP 1/2] Running MC Auxiliary Fits ===" << endl;
     LoadDataset(1);
     AuxFitResult res_sig = FitTemplateMass(44);
     AuxFitResult res_p1 = FitTemplateMass(34);
     AuxFitResult res_p2 = FitTemplateMass(41);
     AuxFitResult res_arg = FitTemplateMass(42);
 
-    cout << "\n=== [STEP 2/3] Running Combinatorial Background Fit ===" << endl;
-    AuxFitResult res_bkg = FitCombinatorialBkg(usePol1Bkg);
-
-    if(!res_sig.isValid || !res_p1.isValid || !res_p2.isValid || !res_arg.isValid
-        || !res_bkg.isValid)
+    if(!res_sig.isValid || !res_p1.isValid || !res_p2.isValid || !res_arg.isValid)
     {
         cerr << "[ERROR] Auxiliary fits failed! Aborting unbinned fit." << endl;
         return;
     }
 
     // 2. Caricamento dei dati reali per il Fit Unbinned
-    cout << "\n=== [STEP 3/3] Preparing Real Data for Unbinned Fit ===" << endl;
+    cout << "\n=== [STEP 2/2] Preparing Real Data for Unbinned Fit ===" << endl;
     LoadDataset(0);
 
     Double_t xMin = 1.65;
@@ -973,8 +909,7 @@ void analysis::DoFullBlindedUnbinnedFit()
     Double_t nEntries = h_mass->GetEntries();
 
     // 3. Setup della PDF e di MINUIT a 20 parametri
-    g_pdf_unbinned
-        = new FullUnbinnedPDF(xMin, xMax, res_sig, res_p1, res_p2, res_arg, res_bkg, usePol1Bkg);
+    g_pdf_unbinned = new FullUnbinnedPDF(xMin, xMax, res_sig, res_p1, res_p2, res_arg, usePol1Bkg);
 
     ROOT::Math::Minimizer *minimizer = ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
     minimizer->SetMaxFunctionCalls(100000);
@@ -986,39 +921,25 @@ void analysis::DoFullBlindedUnbinnedFit()
 
     // Parametri primari (Frazioni e pendenza)
     minimizer->SetVariable(0, "f_s", 0., 0.005);
-    // minimizer->SetVariableLimits(0, 0.0, 1.0);
     minimizer->SetVariable(1, "f_1", 0.025, 0.010);
-    // minimizer->SetVariableLimits(1, 0.0, 1.0);
     minimizer->SetVariable(2, "f_2", 0.051, 0.010);
-    // minimizer->SetVariableLimits(2, 0.0, 1.0);
     minimizer->SetVariable(3, "f_3", 0.625, 0.020);
-    // minimizer->SetVariableLimits(3, 0.0, 1.0);
 
-    double init_slope = res_bkg.params[1];
+    double init_slope = usePol1Bkg ? -1.14501 : -1.14501;
     if(usePol1Bkg)
-    {
         minimizer->SetVariable(4, "pol1_slope", init_slope, 0.05);
-        // minimizer->SetVariableLimits(4, -10.0, 10.0);
-    }
     else
-    {
         minimizer->SetVariable(4, "expo_slope", init_slope, 0.1);
-        // minimizer->SetVariableLimits(4, -20.0, 0.0);
-    }
 
     // Parametri 5-8: Segnale (Double Gauss)
     minimizer->SetVariable(5, "sig_mean", g_pdf_unbinned->m_sig_mean, 0.001);
     minimizer->SetVariable(6, "sig_sigma1", g_pdf_unbinned->m_sig_sigma1, 0.0005);
-    // minimizer->SetVariableLimits(6, 1e-4, 0.05);
     minimizer->SetVariable(7, "sig_sigma2", g_pdf_unbinned->m_sig_sigma2, 0.001);
-    // minimizer->SetVariableLimits(7, 1e-4, 0.10);
     minimizer->SetVariable(8, "sig_frac1", g_pdf_unbinned->m_sig_frac1, 0.05);
-    // minimizer->SetVariableLimits(8, 0.0, 1.0);
 
     // Parametri 9-12: Fondo P1 (Double Gauss)
     minimizer->SetVariable(9, "p1_mean", g_pdf_unbinned->m_p1_mean, 0.001);
     minimizer->SetVariable(10, "p1_sigma1", g_pdf_unbinned->m_p1_sigma1, 0.0005);
-    // minimizer->SetVariableLimits(10, 1e-4, 0.05);
     minimizer->SetVariable(11, "p1_sigma2", g_pdf_unbinned->m_p1_sigma2, 0.001);
     minimizer->FixVariable(11);
     minimizer->SetVariable(12, "p1_frac1", g_pdf_unbinned->m_p1_frac1, 0.05);
@@ -1027,20 +948,15 @@ void analysis::DoFullBlindedUnbinnedFit()
     // Parametri 13-16: Fondo P2 (Double Gauss)
     minimizer->SetVariable(13, "p2_mean", g_pdf_unbinned->m_p2_mean, 0.001);
     minimizer->SetVariable(14, "p2_sigma1", g_pdf_unbinned->m_p2_sigma1, 0.0005);
-    // minimizer->SetVariableLimits(14, 1e-4, 0.05);
     minimizer->SetVariable(15, "p2_sigma2", g_pdf_unbinned->m_p2_sigma2, 0.001);
     minimizer->FixVariable(15);
-    // minimizer->SetVariableLimits(15, 1e-4, 0.10);
     minimizer->SetVariable(16, "p2_frac1", g_pdf_unbinned->m_p2_frac1, 0.05);
     minimizer->FixVariable(16);
-    // minimizer->SetVariableLimits(16, 0.0, 1.0);
 
     // Parametri 17-19: Argus (Fondo 3)
     minimizer->SetVariable(17, "argus_m0", g_pdf_unbinned->m_argus_m0, 0.005);
-    // minimizer->SetVariableLimits(17, 1.90, 2.05);
     minimizer->SetVariable(18, "argus_c", g_pdf_unbinned->m_argus_c, 0.1);
     minimizer->SetVariable(19, "argus_p", g_pdf_unbinned->m_argus_p, 0.05);
-    // minimizer->SetVariableLimits(19, 0.0, 5.0);
 
     // Congela i parametri se i rispettivi flag di sanity check sono false
     if(!floatSignalShape)
@@ -1284,14 +1200,7 @@ void analysis::DoFullBlindedUnbinnedFit()
     pave->SetFillStyle(0);
     pave->SetTextFont(42);
     pave->SetTextSize(0.033);
-    if(usePol1Bkg)
-    {
-        pave->AddText(Form("Pol1 Slope = %.3f #pm %.3f", best_slope, errs[4]));
-    }
-    else
-    {
-        pave->AddText(Form("Lambda Slope = %.3f #pm %.3f", best_slope, errs[4]));
-    }
+
     pave->AddText(Form("#chi^{2} / ndf = %.1f / %d", chi2, ndf));
     pave->AddText(Form("Prob = %.1f%%", TMath::Prob(chi2, ndf) * 100.0));
     pave->Draw();
@@ -1303,10 +1212,10 @@ void analysis::DoFullBlindedUnbinnedFit()
     leg->SetTextSize(0.028);
     leg->AddEntry(h_mass_blind, "Data (Blinded)", "ep");
     leg->AddEntry(f_draw, "Total Fit", "l");
-    leg->AddEntry(f_sig, "Signal (D_{s}^{+} #rightarrow #tau^{+}#nu_{#tau})", "l");
-    leg->AddEntry(f_p1, "D^{+} #rightarrow #phi#pi^{+} Bkg", "l");
-    leg->AddEntry(f_p2, "D_{s}^{+} #rightarrow #phi#pi^{+} Bkg", "l");
-    leg->AddEntry(f_argus, "D_{s}^{+} #rightarrow #phi#mu^{+}#nu_{#mu} (Argus) Bkg", "l");
+    leg->AddEntry(f_sig, "Signal (D_{s}^{+}#rightarrow#tau^{+}#nu_{#tau})", "l");
+    leg->AddEntry(f_p1, "D^{+}#rightarrow#phi#pi^{+} Bkg", "l");
+    leg->AddEntry(f_p2, "D_{s}^{+}#rightarrow#phi#pi^{+} Bkg", "l");
+    leg->AddEntry(f_argus, "D_{s}^{+}#rightarrow#phi#mu^{+}#nu_{#mu} (Argus) Bkg", "l");
     if(usePol1Bkg)
         leg->AddEntry(f_comb, "Combinatorial Bkg (Pol1)", "l");
     else
@@ -1346,9 +1255,109 @@ void analysis::DoFullBlindedUnbinnedFit()
 
     if(savePlots)
     {
-        c_unbinned->Print("./_fig/FitFullUnbinned_Pulls.pdf");
-        c_unbinned->Print("./_fig/FitFullUnbinned_Pulls.root");
+        c_unbinned->SaveAs("./_fig/FitFullUnbinned_Pulls.pdf");
+        c_unbinned->SaveAs("./_root/FitFullUnbinned_Pulls.root");
     }
+
+    // ========================================================================
+    // POINT 7: VALIDATION OF THE PROCEDURE (MEASUREMENT OF R_phi_pi)
+    // ========================================================================
+    cout << "\n=======================================================" << endl;
+    cout << "   VALIDATION CHECK: MEASUREMENT OF R_phi_pi" << endl;
+    cout << "=======================================================" << endl;
+
+    // 1. Calcolo esatto delle efficienze binomiali dai MC
+    // ID 34 = D+ -> phi pi, ID 41 = Ds+ -> phi pi (Tabella 1: 50M generati ciascuno)
+    const double n_gen_Dplus = 50.0e6;
+    const double n_gen_Dsplus = 50.0e6;
+
+    LoadDataset(1); // Carichiamo il file MC
+    long long n_pass_Dplus = 0;
+    long long n_pass_Dsplus = 0;
+
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        fChain->GetEntry(jentry);
+        if(id == 34)
+            n_pass_Dplus++;
+        if(id == 41)
+            n_pass_Dsplus++;
+    }
+
+    // Efficienze fisiche
+    double eff_Dplus = (double)n_pass_Dplus / n_gen_Dplus;
+    double eff_Dsplus = (double)n_pass_Dsplus / n_gen_Dsplus;
+
+    // Rapporto delle efficienze
+    double ratio_eff = eff_Dsplus / eff_Dplus;
+
+    // --- PROPAGAZIONE BINOMIALE ESATTA ---
+    double rel_var_Dsplus = (1.0 - eff_Dsplus) / n_pass_Dsplus;
+    double rel_var_Dplus = (1.0 - eff_Dplus) / n_pass_Dplus;
+
+    double err_ratio_eff = ratio_eff * std::sqrt(rel_var_Dsplus + rel_var_Dplus);
+
+    // 2. Calcolo del rapporto delle frazioni dal fit ai dati (f1 / f2)
+    double f1_val = xs[1];
+    double f2_val = xs[2];
+    double f1_err = errs[1];
+    double f2_err = errs[2];
+    double cov_f1_f2 = minimizer->CovMatrix(1, 2);
+
+    double ratio_yield = f1_val / f2_val;
+
+    // Propagazione dell'errore esatta per una divisione usando la covarianza
+    double err_ratio_yield = ratio_yield
+        * std::sqrt((f1_err * f1_err) / (f1_val * f1_val) + (f2_err * f2_err) / (f2_val * f2_val)
+            - (2.0 * cov_f1_f2) / (f1_val * f2_val));
+
+    // 3. Valore Finale Misurato
+    double R_phipi_meas = ratio_yield * ratio_eff;
+
+    // Errore totale (errore fit e errore MC si sommano in quadratura come incertezze relative)
+    double err_R_phipi_meas = R_phipi_meas
+        * std::sqrt((err_ratio_yield / ratio_yield) * (err_ratio_yield / ratio_yield)
+            + (err_ratio_eff / ratio_eff) * (err_ratio_eff / ratio_eff));
+
+    // 4. Valore Teorico dal PDF (Pagina 4)
+    double sigma_Dplus = 834.0;
+    double sigma_Dsplus = 353.0;
+    double BR_Dplus = 2.69e-3;
+    double BR_Dsplus = 2.25e-2;
+
+    // Nota: Il testo dice che l'errore grande sulle sezioni d'urto si cancella ampiamente nel
+    // rapporto. Propaghiamo solo gli errori statistici decorrelati dei Branching Ratios.
+    double err_BR_Dplus = 0.08e-3;
+    double err_BR_Dsplus = 0.05e-2;
+
+    double R_phipi_ref = (sigma_Dplus * BR_Dplus) / (sigma_Dsplus * BR_Dsplus);
+    double err_R_phipi_ref = R_phipi_ref
+        * std::sqrt((err_BR_Dplus / BR_Dplus) * (err_BR_Dplus / BR_Dplus)
+            + (err_BR_Dsplus / BR_Dsplus) * (err_BR_Dsplus / BR_Dsplus));
+
+    // 5. Confronto (Pull)
+    double diff = std::abs(R_phipi_meas - R_phipi_ref);
+    double combined_err
+        = std::sqrt(err_R_phipi_meas * err_R_phipi_meas + err_R_phipi_ref * err_R_phipi_ref);
+    double pull = diff / combined_err;
+
+    cout << Form("  Eff Ratio (Ds / D+) : %.4f +/- %.4f", ratio_eff, err_ratio_eff) << endl;
+    cout << Form("  Yield Ratio (f1/f2) : %.4f +/- %.4f", ratio_yield, err_ratio_yield) << endl;
+    cout << "-------------------------------------------------------" << endl;
+    cout << Form("  Measured R_phi_pi   : %.4f +/- %.4f", R_phipi_meas, err_R_phipi_meas) << endl;
+    cout << Form("  Expected R_phi_pi   : %.4f +/- %.4f", R_phipi_ref, err_R_phipi_ref) << endl;
+    cout << "-------------------------------------------------------" << endl;
+    cout << Form("  Compatibility       : %.2f sigma", pull) << endl;
+    if(pull < 3.0)
+        cout << "  => SUCCESS: The analysis procedure is validated!" << endl;
+    else
+        cout << "  => WARNING: Discrepancy observed. Check fit model!" << endl;
+    cout << "=======================================================\n" << endl;
+
+    // Riporta LoadDataset a 0 per sicurezza se devi fare altre operazioni dopo
+    LoadDataset(0);
 
     delete minimizer;
     g_pdf_unbinned = nullptr;
@@ -1365,6 +1374,8 @@ struct ToyResult
     double f1_val = 0, f1_err = 0;
     double f2_val = 0, f2_err = 0;
     double f3_val = 0, f3_err = 0;
+    double slope_val = 0, slope_err = 0;
+    double cov_fs_f3 = 0; // Covarianza tra f_s (parametro 0) e f_3 (parametro 3)
 };
 
 // Funzione worker isolata per il singolo thread
@@ -1374,8 +1385,8 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     ToyResult res;
 
     // 1. Generatore di numeri casuali locale al thread (evita conflitti su gRandom)
-    TRandom3 threadRandom(12345 + toyId);
-    gRandom = &threadRandom;
+    TRandom3 threadRandom(THE_SEED * (toyId + 1));
+    // cout << Form("Toy %d: seed = %d", toyId, threadRandom.GetSeed()) << endl;
 
     // 2. Copia locale della PDF per questo thread
     FullUnbinnedPDF localPdf = templatePdf;
@@ -1388,15 +1399,15 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
         return localPdf(&xx, gen_pars.data());
     };
     TF1 fGen(Form("fGen_%d", toyId), gen_lambda, xMin, xMax, 0);
-    fGen.SetNpx(2000);
+    fGen.SetNpx(10000);
 
     // 4. Generazione del dataset locale al thread
     g_data_events.clear();
-    // nEvents = gRandom->Poisson(nEvents);
+    // nEvents = threadRandom->Poisson(nEvents);
     g_data_events.reserve(nEvents);
     for(int ev = 0; ev < nEvents; ++ev)
     {
-        g_data_events.push_back(fGen.GetRandom());
+        g_data_events.push_back(fGen.GetRandom(&threadRandom));
     }
 
     // 5. Setup locale del Minimizzatore
@@ -1408,59 +1419,119 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     ROOT::Math::Functor fNLL(&Unbinned2NLL, 20);
     minimizer->SetFunction(fNLL);
 
+    // =========================================================================
+    //   STRESS TEST: RANDOM MULTISTART INITIALIZATION
+    // =========================================================================
+
+    // 1. f_s (segnale) fluttua casualmente tra -0.05 e +0.05 attorno al valore vero
+    double start_fs = gen_pars[0] + threadRandom.Uniform(-0.02, 0.02);
+
+    // 2. Le frazioni dei fondi f_1, f_2, f_3 variano casualmente del +/- 10%
+    //    rispetto al loro valore vero (es. moltiplicate per un fattore tra 0.8 e 1.2)
+    double start_f1 = gen_pars[1] * threadRandom.Uniform(0.9, 1.1);
+    double start_f2 = gen_pars[2] * threadRandom.Uniform(0.9, 1.1);
+    double start_f3 = gen_pars[3] * threadRandom.Uniform(0.9, 1.1);
+
+    // 3. La pendenza del fondo combinatorio varia casualmente del +/- 10%
+    double start_slope = gen_pars[4] * threadRandom.Uniform(0.9, 1.1);
+
+    // Impostiamo le variabili di partenza di Minuit con questi valori casuali
+    minimizer->SetVariable(0, "f_s", start_fs, 0.005);
+    minimizer->SetVariable(1, "f_1", start_f1, 0.005);
+    minimizer->SetVariable(2, "f_2", start_f2, 0.005);
+    minimizer->SetVariable(3, "f_3", start_f3, 0.005);
+
     // Definizione delle variabili locali
-    minimizer->SetVariable(0, "f_s", 0., 0.005);
-    minimizer->SetVariable(1, "f_1", 0.025, 0.010);
-    minimizer->SetVariable(2, "f_2", 0.051, 0.010);
-    minimizer->SetVariable(3, "f_3", 0.625, 0.020);
+    // minimizer->SetVariable(0, "f_s", gen_pars[0], 0.005);
+    // minimizer->FixVariable(0);
+    // minimizer->SetVariable(1, "f_1", gen_pars[1], 0.005);
+    // minimizer->SetVariable(2, "f_2", gen_pars[2], 0.005);
+    // minimizer->FixVariable(2);
+    // minimizer->SetVariable(3, "f_3", gen_pars[3], 0.005);
+    // minimizer->FixVariable(3);
 
     if(usePol1Bkg)
     {
-        minimizer->SetVariable(4, "pol1_slope", gen_pars[4], 0.05);
+        minimizer->SetVariable(4, "pol1_slope", start_slope, 0.05);
     }
     else
     {
-        minimizer->SetVariable(4, "expo_slope", gen_pars[4], 0.01);
-        minimizer->FixVariable(4);
+        minimizer->SetVariable(4, "expo_slope", start_slope, 0.005);
     }
 
     // Congelamento dei parametri di forma (fissati ai parametri nominali di generazione)
-    minimizer->SetVariable(5, "sig_mean", gen_pars[5], 0.001);
-    minimizer->FixVariable(5);
-    minimizer->SetVariable(6, "sig_sigma1", gen_pars[6], 0.0005);
-    minimizer->FixVariable(6);
-    minimizer->SetVariable(7, "sig_sigma2", gen_pars[7], 0.001);
-    minimizer->FixVariable(7);
-    minimizer->SetVariable(8, "sig_frac1", gen_pars[8], 0.05);
-    minimizer->FixVariable(8);
+    minimizer->SetFixedVariable(5, "sig_mean", gen_pars[5]);
+    minimizer->SetFixedVariable(6, "sig_sigma1", gen_pars[6]);
+    minimizer->SetFixedVariable(7, "sig_sigma2", gen_pars[7]);
+    minimizer->SetFixedVariable(8, "sig_frac1", gen_pars[8]);
 
-    minimizer->SetVariable(9, "p1_mean", gen_pars[9], 0.001);
-    minimizer->FixVariable(9);
-    minimizer->SetVariable(10, "p1_sigma1", gen_pars[10], 0.0005);
-    minimizer->FixVariable(10);
-    minimizer->SetVariable(11, "p1_sigma2", gen_pars[11], 0.001);
-    minimizer->FixVariable(11);
-    minimizer->SetVariable(12, "p1_frac1", gen_pars[12], 0.05);
-    minimizer->FixVariable(12);
+    minimizer->SetFixedVariable(9, "p1_mean", gen_pars[9]);
+    minimizer->SetFixedVariable(10, "p1_sigma1", gen_pars[10]);
+    minimizer->SetFixedVariable(11, "p1_sigma2", gen_pars[11]);
+    minimizer->SetFixedVariable(12, "p1_frac1", gen_pars[12]);
 
-    minimizer->SetVariable(13, "p2_mean", gen_pars[13], 0.001);
-    minimizer->FixVariable(13);
-    minimizer->SetVariable(14, "p2_sigma1", gen_pars[14], 0.0005);
-    minimizer->FixVariable(14);
-    minimizer->SetVariable(15, "p2_sigma2", gen_pars[15], 0.001);
-    minimizer->FixVariable(15);
-    minimizer->SetVariable(16, "p2_frac1", gen_pars[16], 0.05);
-    minimizer->FixVariable(16);
+    minimizer->SetFixedVariable(13, "p2_mean", gen_pars[13]);
+    minimizer->SetFixedVariable(14, "p2_sigma1", gen_pars[14]);
+    minimizer->SetFixedVariable(15, "p2_sigma2", gen_pars[15]);
+    minimizer->SetFixedVariable(16, "p2_frac1", gen_pars[16]);
 
-    minimizer->SetVariable(17, "argus_m0", gen_pars[17], 0.005);
-    minimizer->FixVariable(17);
-    minimizer->SetVariable(18, "argus_c", gen_pars[18], 0.1);
-    minimizer->FixVariable(18);
-    minimizer->SetVariable(19, "argus_p", gen_pars[19], 0.05);
-    minimizer->FixVariable(19);
+    minimizer->SetFixedVariable(17, "argus_m0", gen_pars[17]);
+    minimizer->SetFixedVariable(18, "argus_c", gen_pars[18]);
+    minimizer->SetFixedVariable(19, "argus_p", gen_pars[19]);
 
     minimizer->Minimize();
-    minimizer->Hesse();
+    // minimizer->Hesse(); // Abilitato per ottenere la matrice di covarianza accurata
+
+    int status = minimizer->Status();
+
+    // Se il fit ha fallito (status != 0)
+    if(status != 0)
+    {
+        // Creiamo un file di log specifico per questo singolo toy fallito
+        std::ofstream logFile(Form("./_fig/failed_toy_%d_debug.txt", toyId));
+
+        logFile << "=========================================\n";
+        logFile << "   DIAGNOSTIC LOG FOR FAILED TOY #" << toyId << "\n";
+        logFile << "=========================================\n";
+        logFile << "Minimizer Status: " << status << "\n";
+        logFile << "EDM:              " << minimizer->Edm() << "\n\n";
+
+        // 1. Salviamo lo stato dei parametri al momento del fallimento
+        logFile << "Parameter values at failure:\n";
+        for(unsigned int p = 0; p < minimizer->NDim(); ++p)
+        {
+            logFile << "  " << minimizer->VariableName(p) << " = " << minimizer->X()[p];
+            if(minimizer->IsFixedVariable(p))
+                logFile << " (FIXED)";
+            logFile << "\n";
+        }
+        logFile << "\n";
+
+        // 2. Controlliamo se ci sono eventi che mandano la PDF a zero o negativa
+        logFile << "Checking event PDF values at failure point:\n";
+        int negative_pdf_count = 0;
+        for(size_t i = 0; i < g_data_events.size(); ++i)
+        {
+            double x = g_data_events[i];
+            double pdf_val = (*g_pdf_unbinned)(&x, minimizer->X());
+            if(pdf_val <= 0.0)
+            {
+                negative_pdf_count++;
+                logFile << "  [WARNING] Event #" << i << " (x=" << x << ") has PDF = " << pdf_val
+                        << " (<= 0!)\n";
+            }
+        }
+        logFile << "\nTotal events with PDF <= 0: " << negative_pdf_count << "\n";
+
+        // 3. Salva anche i dati di questo toy specifico così puoi rifittarlo da solo
+        logFile << "\nDataset events:\n";
+        for(double x : g_data_events)
+        {
+            logFile << x << "\n";
+        }
+
+        logFile.close();
+    }
 
     if(minimizer->Status() == 0)
     {
@@ -1473,6 +1544,11 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
         res.f2_err = minimizer->Errors()[2];
         res.f3_val = minimizer->X()[3];
         res.f3_err = minimizer->Errors()[3];
+        res.slope_val = minimizer->X()[4];
+        res.slope_err = minimizer->Errors()[4];
+
+        // Estrazione dell'elemento cov(0, 3) della matrice di errore
+        res.cov_fs_f3 = minimizer->CovMatrix(0, 3);
     }
 
     delete minimizer;
@@ -1480,39 +1556,81 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     return res;
 }
 
-void analysis::RunToyMC(int nToys)
+std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool useBR)
 {
     auto start = std::chrono::high_resolution_clock::now();
 
     SetLBStyle();
     constexpr bool usePol1Bkg = false;
+    // Generatore di numeri casuali locale al thread principale
+    TRandom3 mainRandom(THE_SEED * (static_cast<int>(std::thread::hardware_concurrency())) + 1);
 
     TF1::DefaultAddToGlobalList(kFALSE);
 
-    // 1. Esecuzione dei fit ausiliari nominali
+    // --- [STEP 1] Fit ausiliari nominali ---
     cout << "\n=== [TOY MC] Running Auxiliary Fits ===" << endl;
     LoadDataset(1);
     AuxFitResult res_sig = FitTemplateMass(44);
     AuxFitResult res_p1 = FitTemplateMass(34);
     AuxFitResult res_p2 = FitTemplateMass(41);
     AuxFitResult res_arg = FitTemplateMass(42);
-    AuxFitResult res_bkg = FitCombinatorialBkg(usePol1Bkg);
 
-    if(!res_sig.isValid || !res_p1.isValid || !res_p2.isValid || !res_arg.isValid
-        || !res_bkg.isValid)
+    if(!res_sig.isValid || !res_p1.isValid || !res_p2.isValid || !res_arg.isValid)
     {
         cerr << "[ERROR] Auxiliary fits failed! Aborting Toy MC." << endl;
-        return;
+        return std::make_pair(0.0, 0.0);
     }
 
-    // Frazioni e parametri fisici di generazione
-    const double true_fs = 0.0;
+    // --- [STEP 2] Stima delle efficienze dal Monte Carlo ---
+    cout << "\n--> Estimating Selection Efficiencies from MC..." << endl;
+    const double n_gen_sig = 1.0e6;
+    const double n_gen_norm = 5.0e6;
+
+    long long n_pass_sig = 0;
+    long long n_pass_norm = 0;
+
+    Long64_t nentries_mc = fChain->GetEntries();
+    for(Long64_t jentry = 0; jentry < nentries_mc; jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        fChain->GetEntry(jentry);
+        if(id == 44)
+            n_pass_sig++; // Ds+ -> tau+ nu_tau (Segnale)
+        if(id == 42)
+            n_pass_norm++; // Ds+ -> phi mu+ nu_mu (Normalizzazione)
+    }
+
+    double eff_sig = (double)n_pass_sig / n_gen_sig;
+    double eff_norm = (double)n_pass_norm / n_gen_norm;
+    double r_eff = eff_norm / eff_sig;
+
+    // --- Formula binomiale esatta per l'incertezza del rapporto ---
+    double r_eff_err
+        = r_eff * std::sqrt((1.0 - eff_sig) / n_pass_sig + (1.0 - eff_norm) / n_pass_norm);
+
+    cout << Form("  N_pass (sig)  = %lld, Eff (sig)  = %.6f", n_pass_sig, eff_sig) << endl;
+    cout << Form("  N_pass (norm) = %lld, Eff (norm) = %.6f", n_pass_norm, eff_norm) << endl;
+    cout << Form("  Ratio eff_norm / eff_sig (Binomial) = %.4f +/- %.4f", r_eff, r_eff_err) << endl;
+
+    // --- [STEP 3] Definizione costanti esterne (PDG) ---
+    const double br_taunu_nom = 5.39e-2;
+    const double br_taunu_err = 0.09e-2;
+    const double br_phimunu_nom = 2.24e-2;
+    const double br_phimunu_err = 0.11e-2;
+
+    double k_factor_nom = r_eff * (br_phimunu_nom / br_taunu_nom);
+
+    const double true_fs_val = true_fs;
     const double true_f1 = 0.026;
     const double true_f2 = 0.051;
     const double true_f3 = 0.625;
-    const double true_slope = res_bkg.params[1];
+    const double true_slope = -1.145;
 
-    std::vector<double> gen_pars = { true_fs, true_f1, true_f2, true_f3, true_slope,
+    double true_est = true_fs_val / ((1.0 - true_fs_val) * true_f3);
+    double true_br = true_est * k_factor_nom;
+
+    std::vector<double> gen_pars = { true_fs_val, true_f1, true_f2, true_f3, true_slope,
         res_sig.params[1], res_sig.params[2], res_sig.params[3], res_sig.params[4],
         res_p1.params[1], res_p1.params[2], res_p1.params[3], res_p1.params[4], res_p2.params[1],
         res_p2.params[2], res_p2.params[3], res_p2.params[4], res_arg.params[1], res_arg.params[2],
@@ -1521,10 +1639,8 @@ void analysis::RunToyMC(int nToys)
     Double_t xMin = 1.65;
     Double_t xMax = 2.09;
 
-    // PDF modello base per i thread
-    FullUnbinnedPDF templatePdf(xMin, xMax, res_sig, res_p1, res_p2, res_arg, res_bkg, usePol1Bkg);
+    FullUnbinnedPDF templatePdf(xMin, xMax, res_sig, res_p1, res_p2, res_arg, usePol1Bkg);
 
-    // Conteggio eventi sui dati reali
     LoadDataset(0);
     int nEvents = 0;
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
@@ -1540,16 +1656,14 @@ void analysis::RunToyMC(int nToys)
     if(nEvents == 0)
         nEvents = 10000;
 
-    // Rilevamento automatico del numero di CPU disponibili
-    unsigned int nCores = std::thread::hardware_concurrency();
+    int nCores = static_cast<int>(std::thread::hardware_concurrency());
     if(nCores == 0)
-        nCores = 4; // Fallback generico
+        nCores = 4;
     cout << "[INFO] Launching Toy MC using " << nCores << " parallel threads." << endl;
 
     std::vector<ToyResult> toyResults;
     toyResults.reserve(nToys);
 
-    // 2. Lancio dei thread in blocchi di dimensione pari a 'nCores'
     for(int i = 0; i < nToys; i += nCores)
     {
         std::vector<std::future<ToyResult>> futures;
@@ -1563,7 +1677,6 @@ void analysis::RunToyMC(int nToys)
             currentBatchSize++;
         }
 
-        // Raccogliamo i risultati di questa tranche (questo sincronizza i thread)
         for(auto &f : futures)
         {
             toyResults.push_back(f.get());
@@ -1571,96 +1684,171 @@ void analysis::RunToyMC(int nToys)
         cout << "  Completed toys: " << toyResults.size() << " / " << nToys << "..." << endl;
     }
 
-    // 3. Riempimento degli istogrammi post-elaborazione parallela
-    auto h_fit_fs = new TH1D("h_fit_fs", "Fitted f_{s};f_{s};Toys", 100, 0., 0.);
-    auto h_fit_f1 = new TH1D("h_fit_f1", "Fitted f_{1};f_{1};Toys", 100, 0., 0.);
-    auto h_fit_f2 = new TH1D("h_fit_f2", "Fitted f_{2};f_{2};Toys", 100, 0., 0.);
-    auto h_fit_f3 = new TH1D("h_fit_f3", "Fitted f_{3};f_{3};Toys", 100, 0., 0.);
-
+    // --- [STEP 4] Booking Istogrammi ---
+    // Istogrammi f_s
+    auto h_fit_fs = new TH1D("h_fit_fs", "Fitted f_{s};#Delta f_{s};Toys", 50, -0, 0);
     auto h_pull_fs = new TH1D("h_pull_fs", "Pull f_{s};Pull;Toys", 50, -5.0, 5.0);
+
+    // Istogrammi per l'estimatore di resa grezzo Y = f_s / ((1 - f_s) * f_3)
+    auto h_fit_est = new TH1D("h_fit_est", "Fitted Yield Ratio Y;#Delta Y;Toys", 50, -0, 0);
+    auto h_pull_est = new TH1D("h_pull_est", "Pull Yield Ratio Y;Pull;Toys", 50, -5.0, 5.0);
+
+    // Istogrammi per il Branching Ratio fisico
+    auto h_fit_br = new TH1D(
+        "h_fit_br", "Fitted #f{B}(#tau^{+}#rightarrow#phi#mu^{+});#Delta#f{B};Toys", 50, -0, 0);
+    auto h_pull_br = new TH1D(
+        "h_pull_br", "Pull #f{B}(#tau^{+}#rightarrow#phi#mu^{+});Pull;Toys", 50, -5.0, 5.0);
+
+    // Altri parametri di background
+    auto h_fit_f1 = new TH1D("h_fit_f1", "Fitted f_{1};#Delta f_{1};Toys", 50, -0, 0);
+    auto h_fit_f2 = new TH1D("h_fit_f2", "Fitted f_{2};#Delta f_{2};Toys", 50, -0, 0);
+    auto h_fit_f3 = new TH1D("h_fit_f3", "Fitted f_{3};#Delta f_{3};Toys", 50, -0, 0);
+    auto h_fit_slope = new TH1D("h_fit_slope", "Fitted Slope;#Delta Slope;Toys", 50, -0, 0);
+
     auto h_pull_f1 = new TH1D("h_pull_f1", "Pull f_{1};Pull;Toys", 50, -5.0, 5.0);
     auto h_pull_f2 = new TH1D("h_pull_f2", "Pull f_{2};Pull;Toys", 50, -5.0, 5.0);
     auto h_pull_f3 = new TH1D("h_pull_f3", "Pull f_{3};Pull;Toys", 50, -5.0, 5.0);
+    auto h_pull_slope = new TH1D("h_pull_slope", "Pull Slope;Pull;Toys", 50, -5.0, 5.0);
 
+    // --- [STEP 5] Analisi risultati dei Toy con Smearing dei parametri esterni ---
     int convergedToys = 0;
     for(const auto &res : toyResults)
     {
         if(res.converged)
         {
             convergedToys++;
-            h_fit_fs->Fill(res.fs_val - true_fs);
+
+            h_fit_fs->Fill(res.fs_val - true_fs_val);
             h_fit_f1->Fill(res.f1_val - true_f1);
             h_fit_f2->Fill(res.f2_val - true_f2);
             h_fit_f3->Fill(res.f3_val - true_f3);
+            h_fit_slope->Fill(res.slope_val - true_slope);
 
             if(res.fs_err > 0)
-                h_pull_fs->Fill((res.fs_val - true_fs) / res.fs_err);
+                h_pull_fs->Fill((res.fs_val - true_fs_val) / res.fs_err);
             if(res.f1_err > 0)
                 h_pull_f1->Fill((res.f1_val - true_f1) / res.f1_err);
             if(res.f2_err > 0)
                 h_pull_f2->Fill((res.f2_val - true_f2) / res.f2_err);
             if(res.f3_err > 0)
                 h_pull_f3->Fill((res.f3_val - true_f3) / res.f3_err);
+            if(res.slope_err > 0)
+                h_pull_slope->Fill((res.slope_val - true_slope) / res.slope_err);
+
+            double u = res.fs_val;
+            double v = res.f3_val;
+            double du = res.fs_err;
+            double dv = res.f3_err;
+            double cov_uv = res.cov_fs_f3;
+
+            if(std::abs((1.0 - u) * v) > 1e-9)
+            {
+                double est_val = u / ((1.0 - u) * v);
+                h_fit_est->Fill(est_val - true_est);
+
+                // Calcolo errore propagato dell'estimatore Y
+                double dF_du = 1.0 / ((1.0 - u) * (1.0 - u) * v);
+                double dF_dv = -u / ((1.0 - u) * v * v);
+                double variance_est = (dF_du * dF_du * du * du) + (dF_dv * dF_dv * dv * dv)
+                    + (2.0 * dF_du * dF_dv * cov_uv);
+
+                if(variance_est > 0.0)
+                {
+                    h_pull_est->Fill((est_val - true_est) / std::sqrt(variance_est));
+                }
+
+                // Smearing dei parametri esterni per questo toy (Incertezze statistiche e PDG)
+                double r_eff_toy = mainRandom.Gaus(r_eff, r_eff_err);
+                double br_phimunu_toy = mainRandom.Gaus(br_phimunu_nom, br_phimunu_err);
+                double br_taunu_toy = mainRandom.Gaus(br_taunu_nom, br_taunu_err);
+
+                double k_factor_toy = r_eff_toy * (br_phimunu_toy / br_taunu_toy);
+
+                // Calcolo del Branching Ratio per il toy corrente
+                double br_val = est_val * k_factor_toy;
+                h_fit_br->Fill(br_val - true_br);
+
+                // Incertezza relativa al quadrato del fattore K (usa l'errore binomiale esatto
+                // r_eff_err)
+                double rel_err_k2 = (r_eff_err / r_eff) * (r_eff_err / r_eff)
+                    + (br_phimunu_err / br_phimunu_nom) * (br_phimunu_err / br_phimunu_nom)
+                    + (br_taunu_err / br_taunu_nom) * (br_taunu_err / br_taunu_nom);
+                double err_k = k_factor_nom * std::sqrt(rel_err_k2);
+
+                // Incertezza totale sul BR (composizione dell'errore di Y e di K, indipendenti)
+                double variance_br = (k_factor_nom * k_factor_nom * variance_est)
+                    + (est_val * est_val * err_k * err_k);
+
+                if(variance_br > 0.0)
+                {
+                    double br_err = std::sqrt(variance_br);
+                    h_pull_br->Fill((br_val - true_br) / br_err);
+                }
+            }
         }
     }
 
     cout << "\n[TOY MC RESULTS] Converged: " << convergedToys << " / " << nToys << endl;
 
-    // 4. Visualizzazione e salvataggio dei Canvas
     TF1::DefaultAddToGlobalList(kTRUE);
 
-    TCanvas *cToys = new TCanvas("cToys", "Toy MC Study Results", 1600, 800);
-    cToys->Divide(4, 2);
-
-    auto drawResult = [](TVirtualPad *pad, TH1D *h, double trueVal, bool isPull)
+    // --- [STEP 6] Disegno delle due Canvas richieste ---
+    auto drawResult = [](TVirtualPad *pad, TH1D *h, double trueVal)
     {
         pad->cd();
         h->SetStats(kTRUE);
         gStyle->SetOptStat("emr");
         h->Draw();
-
-        if(!isPull)
-        {
-            TLine *line = new TLine(trueVal, 0, trueVal, h->GetMaximum() * 1.05);
-            line->SetLineColor(kRed);
-            line->SetLineWidth(2);
-            line->SetLineStyle(2);
-            line->Draw();
-        }
-        else
-        {
-            h->Fit("gaus", "Q L");
-            gStyle->SetOptFit(111);
-        }
+        h->Fit("gaus", "Q L I");
+        gStyle->SetOptFit(111);
     };
 
-    drawResult(cToys->GetPad(1), h_fit_fs, true_fs, false);
-    drawResult(cToys->GetPad(2), h_fit_f1, true_f1, false);
-    drawResult(cToys->GetPad(3), h_fit_f2, true_f2, false);
-    drawResult(cToys->GetPad(4), h_fit_f3, true_f3, false);
+    // Canvas 1 aggiornata: fs, Yield Ratio (Y) e Branching Ratio (BR) disposti su 3 colonne
+    TCanvas *cMainEst
+        = new TCanvas("cMainEst", "Main Estimators (fs, Yield Ratio, BR)", 1500, 1000);
+    cMainEst->Divide(3, 2);
 
-    drawResult(cToys->GetPad(5), h_pull_fs, 0.0, true);
-    drawResult(cToys->GetPad(6), h_pull_f1, 0.0, true);
-    drawResult(cToys->GetPad(7), h_pull_f2, 0.0, true);
-    drawResult(cToys->GetPad(8), h_pull_f3, 0.0, true);
+    drawResult(cMainEst->GetPad(1), h_fit_fs, 0.0);
+    drawResult(cMainEst->GetPad(2), h_fit_est, 0.0);
+    drawResult(cMainEst->GetPad(3), h_fit_br, 0.0);
 
-    cToys->Update();
+    drawResult(cMainEst->GetPad(4), h_pull_fs, 0.0);
+    drawResult(cMainEst->GetPad(5), h_pull_est, 0.0);
+    drawResult(cMainEst->GetPad(6), h_pull_br, 0.0);
 
+    cMainEst->Update();
     if(savePlots)
     {
-        cToys->Print("./_fig/ToyMC_Results.pdf");
-        cToys->Print("./_fig/ToyMC_Results.root");
+        cMainEst->SaveAs("./_fig/ToyMC_MainEstimators.pdf");
+        cMainEst->SaveAs("./_root/ToyMC_MainEstimators.root");
+    }
+
+    // Canvas 2: Altri parametri di fit (f1, f2, f3, slope)
+    TCanvas *cOtherPars = new TCanvas("cOtherPars", "Other Fit Parameters", 1600, 800);
+    cOtherPars->Divide(4, 2);
+
+    drawResult(cOtherPars->GetPad(1), h_fit_f1, 0.0);
+    drawResult(cOtherPars->GetPad(2), h_fit_f2, 0.0);
+    drawResult(cOtherPars->GetPad(3), h_fit_f3, 0.0);
+    drawResult(cOtherPars->GetPad(4), h_fit_slope, 0.0);
+
+    drawResult(cOtherPars->GetPad(5), h_pull_f1, 0.0);
+    drawResult(cOtherPars->GetPad(6), h_pull_f2, 0.0);
+    drawResult(cOtherPars->GetPad(7), h_pull_f3, 0.0);
+    drawResult(cOtherPars->GetPad(8), h_pull_slope, 0.0);
+
+    cOtherPars->Update();
+    if(savePlots)
+    {
+        cOtherPars->SaveAs("./_fig/ToyMC_OtherParameters.pdf");
+        cOtherPars->SaveAs("./_root/ToyMC_OtherParameters.root");
     }
 
     // ================================================================================
-    // 5. Generazione e Plot di un Toy di Esempio (Diagnostica nel thread principale)
+    // Sezione diagnostica finale (singolo toy)
     // ================================================================================
     cout << "\n=== [TOY MC] Generating and fitting a single Toy example for diagnostics ==="
          << endl;
-
-    // Generatore di numeri casuali locale al thread principale
-    TRandom3 mainRandom(123456);
-    gRandom = &mainRandom;
 
     // Assegniamo la PDF di riferimento
     g_pdf_unbinned = &templatePdf;
@@ -1683,7 +1871,7 @@ void analysis::RunToyMC(int nToys)
 
     for(int ev = 0; ev < nEvents; ++ev)
     {
-        double val = fGenDiag.GetRandom();
+        double val = fGenDiag.GetRandom(&mainRandom);
         diag_events.push_back(val);
         h_single_toy->Fill(val);
     }
@@ -1701,23 +1889,19 @@ void analysis::RunToyMC(int nToys)
 
     // Inizializzazione parametri (vicini ai valori di generazione)
     minDiag->SetVariable(0, "f_s", 0.01, 0.005);
-    minDiag->SetVariable(1, "f_1", 0.026, 0.010);
-    minDiag->SetVariable(2, "f_2", 0.051, 0.010);
-    minDiag->SetVariable(3, "f_3", 0.625, 0.020);
+    minDiag->SetVariable(1, "f_1", 0.026, 0.005);
+    minDiag->SetVariable(2, "f_2", 0.051, 0.005);
+    minDiag->SetVariable(3, "f_3", 0.625, 0.005);
 
     if(usePol1Bkg)
-    {
-        minDiag->SetVariable(4, "pol1_slope", gen_pars[4], 0.05);
-    }
+        minDiag->SetVariable(4, "pol1_slope", gen_pars[4], 0.005);
     else
-    {
-        minDiag->SetVariable(4, "expo_slope", gen_pars[4], 0.1);
-    }
+        minDiag->SetVariable(4, "expo_slope", gen_pars[4], 0.005);
 
     // Fissiamo tutte le forme ai parametri veri
     for(int p = 5; p < 20; ++p)
     {
-        minDiag->SetVariable(p, Form("p_%d", p), gen_pars[p], 0.01);
+        minDiag->SetVariable(p, Form("p_%d", p), gen_pars[p], 0.005);
         minDiag->FixVariable(p);
     }
 
@@ -1735,6 +1919,7 @@ void analysis::RunToyMC(int nToys)
     double binWidthDiag = h_single_toy->GetBinWidth(1);
     double nEntriesDiag = h_single_toy->GetEntries();
 
+    // --- DEFINIZIONE DELLE LAMBDA (PRIMA dei TF1) ---
     auto scale_pdf_diag = [&templatePdf, nEntriesDiag, binWidthDiag, xsDiag](double *x, double *par)
     {
         double xx = x[0];
@@ -1780,7 +1965,7 @@ void analysis::RunToyMC(int nToys)
         return nEntriesDiag * binWidthDiag * ((1.0 - xsDiag[0]) * xsDiag[3] * p_3);
     };
 
-    // Creazione ed overlay dei TF1 di fit sul Canvas
+    // --- COSTRUZIONE DEI TF1 ---
     TF1 *f_draw_diag = new TF1("f_draw_diag", scale_pdf_diag, xMin, xMax, 0);
     f_draw_diag->SetNpx(5000);
     f_draw_diag->SetLineColor(kBlue);
@@ -1838,8 +2023,8 @@ void analysis::RunToyMC(int nToys)
     legDiag->Draw("SAME");
 
     cSingleToy->Update();
-    cSingleToy->Print("./_fig/ToyMC_SingleFit_Diagnostic.pdf");
-    cSingleToy->Print("./_fig/ToyMC_SingleFit_Diagnostic.root");
+    cSingleToy->SaveAs("./_fig/ToyMC_SingleFit_Diagnostic.pdf");
+    cSingleToy->SaveAs("./_root/ToyMC_SingleFit_Diagnostic.root");
 
     // Pulizia
     delete minDiag;
@@ -1856,4 +2041,868 @@ void analysis::RunToyMC(int nToys)
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Toy MC completed in " << elapsed.count() << " seconds." << std::endl;
+
+    // --- INTERRUTTORE DI RITORNO ---
+    if(useBR)
+    {
+        double mean_br_fit = 0.0;
+        double sigma_br_fit = 0.0;
+        TFitResultPtr fitResBr = h_fit_br->Fit("gaus", "S L Q I N");
+        if(fitResBr.Get() && fitResBr->IsValid())
+        {
+            mean_br_fit = fitResBr->Parameter(1);
+            sigma_br_fit = fitResBr->Parameter(2);
+        }
+        else
+        {
+            mean_br_fit = h_fit_br->GetMean();
+            sigma_br_fit = h_fit_br->GetRMS();
+        }
+        cout << Form("[TOY MC RESULT - BR mode] Mean Shift = %.5e, Sigma (Res) = %.5e", mean_br_fit,
+            sigma_br_fit)
+             << endl;
+        return std::make_pair(mean_br_fit, sigma_br_fit);
+    }
+    else
+    {
+        double mean_fs_fit = 0.0;
+        double sigma_fs_fit = 0.0;
+        TFitResultPtr fitResFs = h_fit_fs->Fit("gaus", "S L Q I N");
+        if(fitResFs.Get() && fitResFs->IsValid())
+        {
+            mean_fs_fit = fitResFs->Parameter(1);
+            sigma_fs_fit = fitResFs->Parameter(2);
+        }
+        else
+        {
+            mean_fs_fit = h_fit_fs->GetMean();
+            sigma_fs_fit = h_fit_fs->GetRMS();
+        }
+        cout << Form("[TOY MC RESULT - fs mode] Mean Shift = %.5e, Sigma (Res) = %.5e", mean_fs_fit,
+            sigma_fs_fit)
+             << endl;
+        return std::make_pair(mean_fs_fit, sigma_fs_fit);
+    }
+}
+
+// ================================================================================
+// Belt Construction
+// ================================================================================
+// Struttura d'appoggio per ordinare l'array in base al Likelihood Ratio
+struct FCPoint
+{
+    double x; // Valore misurato
+    double prob; // Probabilità P(x|mu) * dx
+    double R; // Likelihood Ratio
+
+    // Operatore per ordinare in senso DECRESCENTE rispetto a R
+    bool operator<(const FCPoint &other) const
+    {
+        return R > other.R;
+    }
+};
+
+void analysis::ConstructBelt(double sigma0, double alpha, double max_val, bool useBR)
+{
+    SetLBStyle();
+
+    // Fissiamo univocamente il Confidence Level al 90% come richiesto dalle istruzioni
+    constexpr double target_CL = 0.90;
+
+    // Range dinamico basato sul massimo valore esplorato nei Toy
+    double mu_start = 0.0;
+    double mu_end = max_val;
+    int n_steps = 200; // Numero di punti per rendere la curva liscia
+    double mu_step = (mu_end - mu_start) / n_steps;
+
+    std::vector<double> vec_mu;
+    std::vector<double> vec_x_lower;
+    std::vector<double> vec_x_upper;
+
+    cout << "\n--> Constructing Feldman-Cousins Belt Boundaries (" << (target_CL * 100)
+         << "% CL)..." << endl;
+
+    for(double mu = mu_start; mu <= mu_end; mu += mu_step)
+    {
+        double sigma_mu = sigma0 + alpha * mu;
+
+        std::vector<FCPoint> points;
+        double dx = sigma_mu / 200.0;
+        double x_start = mu - 5.0 * sigma_mu;
+        double x_end = mu + 5.0 * sigma_mu;
+
+        for(double x = x_start; x <= x_end; x += dx)
+        {
+            double par[3] = { mu, sigma0, alpha }; // Ora passi anche alpha e sigma0!
+            double prob_density = TMath::Gaus(x, mu, sigma_mu, kTRUE);
+            double R = LROrdering(&x, par);
+
+            points.push_back({ x, prob_density * dx, R });
+        }
+        /*
+            double sigma = sigma0 + alpha * mu;
+
+            std::vector<FCPoint> points;
+            double dx = sigma / 200.0;
+            double x_start = mu - 5.0 * sigma;
+            double x_end = mu + 5.0 * sigma;
+
+            for(double x = x_start; x <= x_end; x += dx)
+            {
+            double par[2] = { mu, sigma };
+            double prob_density = TMath::Gaus(x, mu, sigma, true);
+            double R = LROrdering(&x, par);
+
+            points.push_back({ x, prob_density * dx, R });
+            }
+        */
+        std::sort(points.begin(), points.end());
+
+        double sum_prob = 0.0;
+        double x_min = 999.0;
+        double x_max = -999.0;
+
+        for(const auto &pt : points)
+        {
+            sum_prob += pt.prob;
+            if(pt.x < x_min)
+                x_min = pt.x;
+            if(pt.x > x_max)
+                x_max = pt.x;
+            if(sum_prob >= target_CL)
+                break;
+        }
+
+        vec_mu.push_back(mu);
+        vec_x_lower.push_back(x_min);
+        vec_x_upper.push_back(x_max);
+    }
+
+    // --- DISEGNO DELLA BANDA ---
+    int nPoints = vec_mu.size();
+    std::vector<double> x_closed;
+    std::vector<double> mu_closed;
+    x_closed.reserve(2 * nPoints);
+    mu_closed.reserve(2 * nPoints);
+
+    for(int i = 0; i < nPoints; ++i)
+    {
+        x_closed.push_back(vec_x_lower[i]);
+        mu_closed.push_back(vec_mu[i]);
+    }
+    for(int i = nPoints - 1; i >= 0; --i)
+    {
+        x_closed.push_back(vec_x_upper[i]);
+        mu_closed.push_back(vec_mu[i]);
+    }
+
+    TGraph *g_belt_filled = new TGraph(x_closed.size(), &x_closed[0], &mu_closed[0]);
+    if(useBR)
+        g_belt_filled->SetFillColorAlpha(kGreen - 9, 0.35);
+    else
+        g_belt_filled->SetFillColorAlpha(kBlue - 9, 0.35);
+    g_belt_filled->SetLineWidth(0);
+
+    TGraph *g_upperEdge = new TGraph(nPoints, &vec_x_lower[0], &vec_mu[0]);
+    TGraph *g_lowerEdge = new TGraph(nPoints, &vec_x_upper[0], &vec_mu[0]);
+    if(useBR)
+    {
+        g_upperEdge->SetLineColor(kGreen + 1);
+        g_lowerEdge->SetLineColor(kGreen + 1);
+    }
+    else
+    {
+        g_upperEdge->SetLineColor(kBlue + 1);
+        g_lowerEdge->SetLineColor(kBlue + 1);
+    }
+    g_upperEdge->SetLineWidth(3);
+    g_lowerEdge->SetLineWidth(3);
+
+    TString canvasName = useBR ? "cBeltBR" : "cBelt_fs";
+    TCanvas *cBelt = new TCanvas(canvasName, "Feldman-Cousins Confidence Belt", 800, 800);
+    cBelt->cd();
+    cBelt->SetGrid();
+
+    double plot_x_min = -3.0 * sigma0;
+    double plot_x_max = mu_end + 3.0 * sigma0;
+
+    TString titleX = useBR ? "Measured #hat{#font[12]{B}}(#tau^{+}#rightarrow#phi#mu^{+})"
+                           : "Measured #hat{f}_{s}";
+    TString titleY = useBR ? "True #font[12]{B}(#tau^{+}#rightarrow#phi#mu^{+})" : "True f_{s}";
+    TString frameTitle
+        = Form("Feldman-Cousins Confidence Belt (90%% CL);%s;%s", titleX.Data(), titleY.Data());
+
+    TH2F *hFrame = new TH2F("hFrame", frameTitle, 100, plot_x_min, plot_x_max, 100, 0.0, mu_end);
+    hFrame->SetStats(0);
+    hFrame->Draw();
+
+    g_belt_filled->Draw("F SAME");
+    g_upperEdge->Draw("L SAME");
+    g_lowerEdge->Draw("L SAME");
+
+    TLine *diag = new TLine(0.0, 0.0, mu_end, mu_end);
+    diag->SetLineStyle(2);
+    diag->SetLineColor(kGray + 2);
+    diag->Draw("SAME");
+
+    TLine *vert_zero = new TLine(0.0, 0.0, 0.0, mu_end);
+    vert_zero->SetLineStyle(3);
+    vert_zero->SetLineColor(kBlack);
+    vert_zero->Draw("SAME");
+
+    cBelt->Update();
+
+    TString saveName_fig
+        = useBR ? "./_fig/FeldmanCousinsBelt_BR_Filled" : "./_fig/FeldmanCousinsBelt_fs_Filled";
+    cBelt->SaveAs(saveName_fig + ".pdf");
+    TString saveName_root
+        = useBR ? "./_root/FeldmanCousinsBelt_BR_Filled" : "./_root/FeldmanCousinsBelt_fs_Filled";
+    cBelt->SaveAs(saveName_root + ".root");
+
+    cout << "Filled Belt (90% CL) successfully generated and saved!" << endl;
+}
+
+void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint, bool useBR)
+{
+    cout << "\n=======================================================" << endl;
+    cout << Form("   STARTING AUTOMATED FELDMAN-COUSINS PIPELINE (%s mode)", useBR ? "BR" : "fs")
+         << endl;
+    cout << "=======================================================" << endl;
+
+    // Fattori nominali costanti
+    double r_eff = 0.2212;
+    const double br_taunu_nom = 5.39e-2;
+    const double br_phimunu_nom = 2.24e-2;
+    double k_factor_nom = r_eff * (br_phimunu_nom / br_taunu_nom);
+    double true_f3 = 0.625;
+
+    // Definiamo i punti nominali su f_s (generiamo SEMPRE a partire da qui)
+    std::vector<double> fs_points = { 0.0, 0.0025, 0.0050, 0.0075, 0.0100 };
+
+    std::vector<double> x_true;
+    std::vector<double> y_sigma;
+    std::vector<double> y_bias; // Salveremo il bias (mean shift) di ciascun punto
+
+    for(double fs : fs_points)
+    {
+        // 1. Calcolo esatto del BR equivalente
+        double true_br = (fs / ((1.0 - fs) * true_f3)) * k_factor_nom;
+
+        if(useBR)
+            cout << Form("\n--> Running Toy: true_fs = %.4f => true_BR = %.2e", fs, true_br)
+                 << endl;
+        else
+            cout << Form("\n--> Running Toy: true_fs = %.4f", fs) << endl;
+
+        // 2. Lancio del Toy (restituisce la coppia <mean_shift, sigma>)
+        auto results = RunToyMC(nToysPerPoint, fs, useBR);
+        double bias_misurato = results.first;
+        double sigma_misurata = results.second;
+
+        // 3. Salviamo le coordinate per i fit e i controlli
+        if(useBR)
+        {
+            x_true.push_back(true_br);
+        }
+        else
+        {
+            x_true.push_back(fs);
+        }
+        y_sigma.push_back(sigma_misurata);
+        y_bias.push_back(bias_misurato);
+    }
+
+    // Valore massimo dell'asse X per disegnare correttamente la banda
+    double max_x_val = x_true.back();
+
+    // --- FIT DELLA RISOLUZIONE (USANDO LE VARIABILI RISCALATE PER MINUIT) ---
+    double scale = useBR ? 1e7 : 1e3;
+    std::vector<double> x_scaled(x_true.size());
+    std::vector<double> y_scaled(y_sigma.size());
+
+    for(size_t i = 0; i < x_true.size(); ++i)
+    {
+        x_scaled[i] = x_true[i] * scale;
+        y_scaled[i] = y_sigma[i] * scale;
+    }
+
+    TGraph *g_res = new TGraph(x_scaled.size(), &x_scaled[0], &y_scaled[0]);
+    TF1 *f_linear = new TF1("f_linear", "[0] + [1]*x", 0.0, max_x_val * scale * 1.2);
+
+    f_linear->SetParameters(y_scaled[0], 0.0);
+    cout << "\n--> Fitting resolution dependency..." << endl;
+    g_res->Fit(f_linear, "Q");
+
+    double sigma0 = f_linear->GetParameter(0) / scale;
+    double alpha = f_linear->GetParameter(1);
+
+    cout << "=======================================================" << endl;
+    cout << Form("   FIT RESULTS FOR RESOLUTION FUNCTION sigma(%s):", useBR ? "BR" : "fs") << endl;
+    cout << Form("   sigma(X) = %.5e + %.5f * X", sigma0, alpha) << endl;
+    cout << "=======================================================" << endl;
+
+    // =========================================================================
+    // SANITY CHECK 1: COMPORTAMENTO DELLA RISOLUZIONE (PLOT FISICO)
+    // =========================================================================
+    TCanvas *cResCheck = new TCanvas("cResCheck", "Resolution Sanity Check", 800, 600);
+    cResCheck->SetGrid();
+
+    TGraphErrors *g_res_physical = new TGraphErrors(x_true.size());
+    for(size_t i = 0; i < x_true.size(); ++i)
+    {
+        g_res_physical->SetPoint(i, x_true[i], y_sigma[i]);
+        // Incertezza statistica della sigma stimata dai Toy: sigma / sqrt(2*N)
+        double err_y = y_sigma[i] / std::sqrt(2.0 * nToysPerPoint);
+        g_res_physical->SetPointError(i, 0.0, err_y);
+    }
+
+    g_res_physical->SetMarkerStyle(20);
+    g_res_physical->SetMarkerSize(1.2);
+    g_res_physical->SetMarkerColor(kBlue + 1);
+    g_res_physical->SetLineColor(kBlue + 1);
+
+    TString titleX = useBR ? "True B(#tau^{+}#rightarrow#phi#mu^{+})" : "True f_{s}";
+    TString titleY = useBR ? "#sigma(B)" : "#sigma(f_{s})";
+    g_res_physical->SetTitle(Form("Resolution Fit;%s;%s", titleX.Data(), titleY.Data()));
+    g_res_physical->GetXaxis()->SetMaxDigits(3);
+    g_res_physical->GetYaxis()->SetMaxDigits(3);
+    g_res_physical->Draw("AP");
+
+    // Sovrapponiamo la funzione lineare con i parametri de-scalati corretti
+    TF1 *f_phys = new TF1("f_phys", "[0] + [1]*x", 0.0, max_x_val * 1.2);
+    f_phys->SetParameters(sigma0, alpha);
+    f_phys->SetLineColor(kRed);
+    f_phys->SetLineWidth(3);
+    f_phys->Draw("SAME");
+
+    TPaveText *paveRes = new TPaveText(0.15, 0.72, 0.45, 0.88, "NDC");
+    paveRes->SetBorderSize(1);
+    paveRes->SetFillColor(kWhite);
+    paveRes->SetTextFont(42);
+    paveRes->SetTextSize(0.03);
+    paveRes->AddText(Form("#sigma_{0} = %.3e", sigma0));
+    paveRes->AddText(Form("#alpha = %.4f", alpha));
+    paveRes->Draw();
+
+    cResCheck->Update();
+    cResCheck->SaveAs(
+        useBR ? "./_fig/SanityCheck_Resolution_BR.pdf" : "./_fig/SanityCheck_Resolution_fs.pdf");
+
+    // =========================================================================
+    // SANITY CHECK 2: COMPORTAMENTO DEL BIAS (COERENTE CON ZERO)
+    // =========================================================================
+    TCanvas *cBiasCheck = new TCanvas("cBiasCheck", "Bias Sanity Check", 800, 600);
+    cBiasCheck->SetGrid();
+
+    TGraphErrors *g_bias_physical = new TGraphErrors(x_true.size());
+    for(size_t i = 0; i < x_true.size(); ++i)
+    {
+        g_bias_physical->SetPoint(i, x_true[i], y_bias[i]);
+        // Errore statistico del valor medio (errore sulla media dei Toy): sigma_toy / sqrt(N_toy)
+        double err_y = y_sigma[i] / std::sqrt(nToysPerPoint);
+        g_bias_physical->SetPointError(i, 0.0, err_y);
+    }
+
+    g_bias_physical->SetMarkerStyle(21);
+    g_bias_physical->SetMarkerSize(1.2);
+    g_bias_physical->SetMarkerColor(kBlack);
+    g_bias_physical->SetLineColor(kBlack);
+
+    TString titleY_bias = useBR ? "Bias: Fitted B - True B" : "Bias: Fitted f_{s} - True f_{s}";
+    g_bias_physical->SetTitle(Form("Bias Check;%s;%s", titleX.Data(), titleY_bias.Data()));
+    g_bias_physical->GetXaxis()->SetMaxDigits(3);
+    g_bias_physical->GetYaxis()->SetMaxDigits(3);
+
+    // Impostiamo l'asse Y simmetrico intorno a 0 per una visualizzazione ottimale del bias
+    double max_err = 0.0;
+    for(size_t i = 0; i < x_true.size(); ++i)
+    {
+        double val = std::abs(y_bias[i]) + 3.0 * (y_sigma[i] / std::sqrt(nToysPerPoint));
+        if(val > max_err)
+            max_err = val;
+    }
+    g_bias_physical->SetMinimum(-max_err);
+    g_bias_physical->SetMaximum(max_err);
+    g_bias_physical->Draw("AP");
+
+    // Disegnamo la linea dello zero teorico (nessun bias)
+    TLine *lZero = new TLine(0.0, 0.0, max_x_val * 1.2, 0.0);
+    lZero->SetLineStyle(2);
+    lZero->SetLineColor(kRed);
+    lZero->SetLineWidth(2);
+    lZero->Draw("SAME");
+
+    cBiasCheck->Update();
+    cBiasCheck->SaveAs(useBR ? "./_fig/SanityCheck_Bias_BR.pdf" : "./_fig/SanityCheck_Bias_fs.pdf");
+
+    // 4. Costruzione geometrica finale della Belt
+    ConstructBelt(sigma0, alpha, max_x_val, useBR);
+
+    delete g_res;
+    delete f_linear;
+    delete g_res_physical;
+    delete f_phys;
+    delete cResCheck;
+    delete g_bias_physical;
+    delete lZero;
+    delete cBiasCheck;
+}
+
+// ================================================================================
+// Wilks Validation
+// ================================================================================
+struct WilksResult
+{
+    bool converged = false;
+    double delta_F = 0.0; // Questo conterrà il valore di t0 = F_0 - F_min
+    double fs_fitted = 0.0;
+};
+
+// Funzione worker isolata per calcolare la differenza di Likelihood su singolo Toy
+WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePdf,
+    const std::vector<double> &gen_pars, bool usePol1Bkg, double xMin, double xMax)
+{
+    WilksResult res;
+
+    // 1. Generatore di numeri casuali locale (true_fs = 0.0 per l'ipotesi nulla)
+    TRandom3 threadRandom(THE_SEED * (toyId + 1));
+
+    FullUnbinnedPDF localPdf = templatePdf;
+    g_pdf_unbinned = &localPdf;
+
+    std::vector<double> null_gen_pars = gen_pars;
+    null_gen_pars[0] = 0.0; // Generazione rigorosamente sotto H0 (f_s = 0)
+
+    auto gen_lambda = [&localPdf, &null_gen_pars](double *x, double *par)
+    {
+        double xx = x[0];
+        return localPdf(&xx, null_gen_pars.data());
+    };
+    TF1 fGen(Form("fGenWilks_%d", toyId), gen_lambda, xMin, xMax, 0);
+    fGen.SetNpx(10000);
+
+    g_data_events.clear();
+    g_data_events.reserve(nEvents);
+    for(int ev = 0; ev < nEvents; ++ev)
+    {
+        g_data_events.push_back(fGen.GetRandom(&threadRandom));
+    }
+
+    // =========================================================================
+    // FIT 1: IPOTESI ALTERNATIVA (f_s COMPLETAMENTE LIBERO - UNCONSTRAINED)
+    // =========================================================================
+    ROOT::Math::Minimizer *minAlt = ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+    minAlt->SetMaxFunctionCalls(50000);
+    minAlt->SetTolerance(0.01);
+    minAlt->SetPrintLevel(-1);
+
+    ROOT::Math::Functor fNLL(&Unbinned2NLL, 20);
+    minAlt->SetFunction(fNLL);
+
+    // Definiamo f_s senza limiti: può fluttuare liberamente nel negativo
+    minAlt->SetVariable(0, "f_s", 0.0, 0.005);
+    // minAlt->SetVariableLimits(0, 0.0, 1.0); // <-- RIMOZIONE DEL LIMITE!
+
+    minAlt->SetVariable(1, "f_1", gen_pars[1], 0.005);
+    minAlt->SetVariable(2, "f_2", gen_pars[2], 0.005);
+    minAlt->SetVariable(3, "f_3", gen_pars[3], 0.005);
+
+    if(usePol1Bkg)
+        minAlt->SetVariable(4, "pol1_slope", gen_pars[4], 0.05);
+    else
+        minAlt->SetVariable(4, "expo_slope", gen_pars[4], 0.005);
+
+    for(int p = 5; p < 20; ++p)
+    {
+        minAlt->SetVariable(p, Form("p_%d", p), gen_pars[p], 0.005);
+        minAlt->FixVariable(p);
+    }
+
+    minAlt->Minimize();
+
+    if(minAlt->Status() != 0)
+    {
+        delete minAlt;
+        g_pdf_unbinned = nullptr;
+        return res;
+    }
+
+    double F_min = minAlt->MinValue();
+    double fs_fitted = minAlt->X()[0];
+
+    // =========================================================================
+    // FIT 2: IPOTESI NULLA (f_s FISSO A ZERO)
+    // =========================================================================
+    ROOT::Math::Minimizer *minNull = ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+    minNull->SetMaxFunctionCalls(50000);
+    minNull->SetTolerance(0.01);
+    minNull->SetPrintLevel(-1);
+    minNull->SetFunction(fNLL);
+
+    minNull->SetVariable(0, "f_s", 0.0, 0.005);
+    minNull->FixVariable(0);
+
+    minNull->SetVariable(1, "f_1", gen_pars[1], 0.005);
+    minNull->SetVariable(2, "f_2", gen_pars[2], 0.005);
+    minNull->SetVariable(3, "f_3", gen_pars[3], 0.005);
+
+    if(usePol1Bkg)
+        minNull->SetVariable(4, "pol1_slope", gen_pars[4], 0.05);
+    else
+        minNull->SetVariable(4, "expo_slope", gen_pars[4], 0.005);
+
+    for(int p = 5; p < 20; ++p)
+    {
+        minNull->SetVariable(p, Form("p_%d", p), gen_pars[p], 0.005);
+        minNull->FixVariable(p);
+    }
+
+    minNull->Minimize();
+
+    if(minNull->Status() != 0)
+    {
+        delete minAlt;
+        delete minNull;
+        g_pdf_unbinned = nullptr;
+        return res;
+    }
+
+    double F_0 = minNull->MinValue();
+
+    res.converged = true;
+    res.fs_fitted = fs_fitted;
+    res.delta_F = F_0 - F_min;
+
+    if(res.delta_F < 0.0)
+        res.delta_F = 0.0;
+
+    delete minAlt;
+    delete minNull;
+    g_pdf_unbinned = nullptr;
+    return res;
+}
+
+void analysis::VerifyWilksTheorem(int nToys)
+{
+    auto start = std::chrono::high_resolution_clock::now();
+    SetLBStyle();
+    constexpr bool usePol1Bkg = false;
+
+    // --- SALVAVITA MULTI-THREADING PER ROOT ---
+    TF1::DefaultAddToGlobalList(kFALSE);
+
+    // --- [STEP 1] Fit ausiliari per le forme ---
+    cout << "\n=== [WILKS CHECK] Running Auxiliary Fits ===" << endl;
+    LoadDataset(1);
+    AuxFitResult res_sig = FitTemplateMass(44);
+    AuxFitResult res_p1 = FitTemplateMass(34);
+    AuxFitResult res_p2 = FitTemplateMass(41);
+    AuxFitResult res_arg = FitTemplateMass(42);
+
+    if(!res_sig.isValid || !res_p1.isValid || !res_p2.isValid || !res_arg.isValid)
+    {
+        cerr << "[ERROR] Auxiliary fits failed! Aborting Wilks check." << endl;
+        TF1::DefaultAddToGlobalList(kTRUE);
+        return;
+    }
+
+    std::vector<double> gen_pars = { 0.0, 0.026, 0.051, 0.625, -1.145, res_sig.params[1],
+        res_sig.params[2], res_sig.params[3], res_sig.params[4], res_p1.params[1], res_p1.params[2],
+        res_p1.params[3], res_p1.params[4], res_p2.params[1], res_p2.params[2], res_p2.params[3],
+        res_p2.params[4], res_arg.params[1], res_arg.params[2], res_arg.params[3] };
+
+    Double_t xMin = 1.65;
+    Double_t xMax = 2.09;
+    FullUnbinnedPDF templatePdf(xMin, xMax, res_sig, res_p1, res_p2, res_arg, usePol1Bkg);
+
+    // Conteggio eventi totali dai dati reali
+    LoadDataset(0);
+    int nEvents = 0;
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        fChain->GetEntry(jentry);
+        if(id == 0 && D_M >= xMin && D_M <= xMax)
+            nEvents++;
+    }
+    if(nEvents == 0)
+        nEvents = 10000;
+
+    int nCores = static_cast<int>(std::thread::hardware_concurrency());
+    if(nCores == 0)
+        nCores = 4;
+    cout << "[INFO] Launching " << nToys << " Unconstrained Wilks Toys on " << nCores << " cores."
+         << endl;
+
+    std::vector<WilksResult> wilksResults;
+    wilksResults.reserve(nToys);
+
+    for(int i = 0; i < nToys; i += nCores)
+    {
+        std::vector<std::future<WilksResult>> futures;
+        for(int t = 0; (t < nCores) && (i + t) < nToys; ++t)
+        {
+            int toyId = i + t;
+            futures.push_back(std::async(std::launch::async, RunSingleWilksToy, toyId, nEvents,
+                std::ref(templatePdf), std::cref(gen_pars), usePol1Bkg, xMin, xMax));
+        }
+        for(auto &f : futures)
+        {
+            wilksResults.push_back(f.get());
+        }
+        cout << "\r  Completed Wilks toys: " << wilksResults.size() << " / " << nToys << "..."
+             << flush;
+    }
+
+    // --- [STEP 2] Booking Istogramma per Delta_F ---
+    TH1D *h_delta_F = new TH1D(
+        "h_delta_F", "Wilks Theorem Check;#Delta F = F_{0} - F_{min};Toys", 50, 0.0, 10.0);
+    h_delta_F->SetDirectory(nullptr);
+
+    int convergedToys = 0;
+    for(const auto &res : wilksResults)
+    {
+        if(res.converged)
+        {
+            convergedToys++;
+            h_delta_F->Fill(res.delta_F);
+        }
+    }
+
+    cout << "\n[WILKS RESULTS] Converged: " << convergedToys << " / " << nToys << endl;
+
+    // --- [STEP 3] Plotting e Overplot Teorico con Residui (Pulls) ---
+    TCanvas *cWilks = new TCanvas("cWilks", "Wilks Theorem Validation with Pulls", 900, 900);
+    double splitPoint = 0.30;
+
+    // Pad Superiore (Plot Principale)
+    TPad *pad1 = new TPad("pad1", "Main Pad", 0.0, splitPoint, 1.0, 1.0);
+    pad1->SetBottomMargin(0.02); // Tocca il pad inferiore senza spazio bianco
+    pad1->Draw();
+    pad1->cd();
+    pad1->SetGrid();
+
+    h_delta_F->SetMinimum(0.0);
+    h_delta_F->GetXaxis()->SetLabelSize(0); // Nascondiamo l'asse X superiore
+    h_delta_F->GetXaxis()->SetTitleSize(0);
+    h_delta_F->SetMarkerStyle(20);
+    h_delta_F->SetMarkerSize(1.0);
+    h_delta_F->Draw("E P");
+
+    // 1. Definisci la PDF pura (SENZA la larghezza del bin nella normalizzazione)
+    // Nota: parto da > 0 per evitare il div by zero nei calcoli interni di ROOT,
+    // ma l'integrale ROOT lo gestirà benissimo
+    TF1 *f_chi2_theory
+        = new TF1("f_chi2_theory", "[0] * exp(-0.5*x) / sqrt(2.0 * TMath::Pi() * x)", 1e-6, 10.0);
+    f_chi2_theory->SetNpx(1000);
+
+    // Normalizzazione = solo numero totale di toy
+    f_chi2_theory->SetParameter(0, convergedToys);
+
+    // 2. Per disegnare la curva continua riscalata ai bin (solo per la vista)
+    TF1 *f_chi2_draw = (TF1 *)f_chi2_theory->Clone("f_chi2_draw");
+    f_chi2_draw->SetParameter(0, convergedToys * h_delta_F->GetBinWidth(1));
+    f_chi2_draw->SetLineColor(kRed);
+    f_chi2_draw->SetLineWidth(3);
+    f_chi2_draw->Draw("SAME");
+
+    TLegend *leg = new TLegend(0.45, 0.65, 0.88, 0.85);
+    leg->SetBorderSize(1);
+    leg->SetFillColor(kWhite);
+    leg->SetTextFont(42);
+    leg->SetTextSize(0.03);
+    leg->AddEntry(h_delta_F, Form("Toy MC under H_{0} (%d toys)", convergedToys), "ep");
+    leg->AddEntry(f_chi2_theory, "Pure Wilks Theory: #chi^{2}_{1}(#Delta F)", "l");
+    leg->Draw("SAME");
+
+    // Pad Inferiore (Plot dei Residui / Pulls)
+    cWilks->cd();
+    TPad *pad2 = new TPad("pad2", "Pull Pad", 0.0, 0.0, 1.0, splitPoint);
+    pad2->SetTopMargin(0.02);
+    pad2->SetBottomMargin(0.35); // Spazio per i titoli dell'asse X
+    pad2->SetGridy();
+    pad2->Draw();
+    pad2->cd();
+
+    TH1D *hPull = (TH1D *)h_delta_F->Clone("hPull_wilks");
+    hPull->Reset();
+    for(int i = 1; i <= h_delta_F->GetNbinsX(); ++i)
+    {
+        double obs = h_delta_F->GetBinContent(i);
+        double err = h_delta_F->GetBinError(i);
+        double binLow = h_delta_F->GetXaxis()->GetBinLowEdge(i);
+        double binUp = h_delta_F->GetXaxis()->GetBinUpEdge(i);
+
+        // 1. Calcolo analitico esatto della frazione tramite la CDF (senza integrazione numerica)
+        double fraction = TMath::Erf(std::sqrt(binUp / 2.0)) - TMath::Erf(std::sqrt(binLow / 2.0));
+        double exp = convergedToys * fraction;
+
+        if(err > 0.0)
+        {
+            double pull = (obs - exp) / err;
+            hPull->SetBinContent(i, pull);
+            hPull->SetBinError(i, 0.0); // Nessuna barra d'errore sul punto del pull
+        }
+        else
+        {
+            hPull->SetBinContent(i, -999.0);
+        }
+    }
+
+    hPull->GetYaxis()->SetTitle("Pull");
+    hPull->GetYaxis()->SetTitleSize(gStyle->GetTitleSize("Y") * 0.8);
+    hPull->GetYaxis()->SetLabelSize(gStyle->GetLabelSize("Y") * 0.8);
+    hPull->GetYaxis()->SetTitleOffset(gStyle->GetTitleOffset("Y") * 1.2);
+    hPull->GetYaxis()->SetRangeUser(-5.0, 5.0); // I pull oscillano tipicamente tra -3 e 3
+
+    hPull->GetXaxis()->SetTitle("#Delta F = F_{0} - F_{min}");
+    hPull->GetXaxis()->SetTitleSize(gStyle->GetTitleSize("X") * 0.8);
+    hPull->GetXaxis()->SetLabelSize(gStyle->GetLabelSize("X") * 0.8);
+    hPull->GetXaxis()->SetTitleOffset(gStyle->GetTitleOffset("X") * 1.1);
+
+    hPull->SetMarkerStyle(20);
+    hPull->SetMarkerSize(0.8);
+    hPull->SetMarkerColor(kBlack);
+    hPull->SetLineColor(kBlack);
+    hPull->Draw("P");
+
+    // Linea di riferimento a Zero
+    TLine *line0 = new TLine(0.0, 0.0, 10.0, 0.0);
+    line0->SetLineColor(kRed);
+    line0->SetLineWidth(2);
+    line0->Draw("SAME");
+
+    cWilks->Update();
+    cWilks->SaveAs("./_fig/SanityCheck_Wilks_Pure.pdf");
+    cWilks->SaveAs("./_root/SanityCheck_Wilks_Pure.root");
+
+    while(gROOT->GetListOfCanvases()->FindObject("cWilks"))
+    {
+        gSystem->ProcessEvents(); // Gestisce i movimenti del mouse, zoom, click, ecc.
+        gSystem->Sleep(50); // Dorme 50 millisecondi per non sovraccaricare la CPU
+    }
+
+    // =========================================================================
+    // CALCOLO DELLA CDF ED ESECUZIONE DEL TEST DI KOLMOGOROV-SMIRNOV (UNBINNED)
+    // =========================================================================
+
+    // 1. Raccogliamo i Delta F dei toy convertiti e ordiniamoli
+    std::vector<double> toy_deltas;
+    toy_deltas.reserve(convergedToys);
+    for(const auto &res : wilksResults)
+    {
+        if(res.converged)
+        {
+            toy_deltas.push_back(res.delta_F);
+        }
+    }
+    std::sort(toy_deltas.begin(), toy_deltas.end());
+
+    // 2. Calcolo manuale e rigoroso della statistica KS (D_max)
+    double max_D = 0.0;
+    int N = toy_deltas.size();
+
+    TGraph *g_cdf_emp = new TGraph(N); // Grafico per la CDF sperimentale (dei toy)
+
+    for(int i = 0; i < N; ++i)
+    {
+        double x = toy_deltas[i];
+        double f_emp = (double)(i + 1) / N; // CDF empirica: frazione di toy <= x
+        double f_theo = TMath::Erf(std::sqrt(x / 2.0)); // CDF teorica del Chi2(1)
+
+        g_cdf_emp->SetPoint(i, x, f_emp);
+
+        double diff = std::abs(f_emp - f_theo);
+        if(diff > max_D)
+        {
+            max_D = diff;
+        }
+    }
+
+    // Calcoliamo il p-value di Kolmogorov-Smirnov usando la libreria di ROOT
+    double ks_p_value = TMath::KolmogorovProb(max_D * std::sqrt(N));
+
+    std::cout << "\n=======================================================" << endl;
+    std::cout << "   KOLMOGOROV-SMIRNOV TEST RESULTS (UNBINNED)" << endl;
+    std::cout << "=======================================================" << endl;
+    std::cout << Form("  Number of Toys (N):  %d", N) << endl;
+    std::cout << Form("  KS Distance (d_max): %.4f", max_D) << endl;
+    std::cout << Form("  KS p-value:          %.4f (%.1f%%)", ks_p_value, ks_p_value * 100.0)
+              << endl;
+    std::cout << "=======================================================\n" << endl;
+
+    // 3. Creazione del Canvas per il Plot della CDF
+    TCanvas *cCDF = new TCanvas("cCDF", "Cumulative Distribution Function & KS Test", 800, 600);
+    cCDF->cd();
+    cCDF->SetGrid();
+
+    // Creiamo un frame per gli assi (asse Y va rigorosamente da 0 a 1 per una probabilità)
+    TH2F *hFrameCDF = new TH2F("hFrameCDF",
+        "Wilks Theorem Validation (CDF);#Delta F = F_{0} - F_{min};Cumulative Probability", 100,
+        0.0, 10.0, 100, 0.0, 1.05);
+    hFrameCDF->SetStats(0);
+    hFrameCDF->Draw();
+
+    // Disegniamo la CDF teorica (Chi2 a 1 grado di libertà)
+    TF1 *f_cdf_theo = new TF1("f_cdf_theo", "TMath::Erf(std::sqrt(x/2.0))", 0.0, 10.0);
+    f_cdf_theo->SetNpx(1000);
+    f_cdf_theo->SetLineColor(kRed);
+    f_cdf_theo->SetLineWidth(3);
+    f_cdf_theo->Draw("SAME");
+
+    // Disegniamo la CDF empirica dei tuoi Toy
+    g_cdf_emp->SetMarkerStyle(20);
+    g_cdf_emp->SetMarkerSize(0.6);
+    g_cdf_emp->SetMarkerColor(kBlack);
+    g_cdf_emp->SetLineColor(kBlack);
+    g_cdf_emp->SetLineWidth(1);
+    g_cdf_emp->Draw("P SAME");
+
+    // Legenda con font e dimensione forzati a valori relativi sicuri
+    TLegend *legCDF = new TLegend(0.15, 0.70, 0.55, 0.85);
+    legCDF->SetBorderSize(1);
+    legCDF->SetFillColor(kWhite);
+    legCDF->SetTextFont(42); // Font 42 (dimensione relativa, non in pixel)
+    legCDF->SetTextSize(0.035); // 3.5% dell'altezza della finestra (molto sicuro)
+    legCDF->AddEntry(g_cdf_emp, Form("Toy MC under H_{0} (%d toys)", N), "ep");
+    legCDF->AddEntry(f_cdf_theo, "Pure Wilks Theory: F_{#chi^{2}_{1}}(#Delta F)", "l");
+    legCDF->Draw("SAME");
+
+    // Box di testo KS con font e dimensione forzati
+    TPaveText *paveKS = new TPaveText(0.55, 0.15, 0.88, 0.32, "NDC");
+    paveKS->SetBorderSize(1);
+    paveKS->SetFillColor(kWhite);
+    paveKS->SetTextFont(42); // Font 42
+    paveKS->SetTextSize(0.035); // Dimensione del testo 3.5%
+    paveKS->SetTextAlign(12); // Allineamento a sinistra
+    paveKS->AddText(Form("KS d_{max} = %.4f", max_D));
+    paveKS->AddText(Form("KS p-value = %.4f", ks_p_value));
+    paveKS->Draw();
+
+    cCDF->Update();
+    cCDF->SaveAs("./_fig/SanityCheck_Wilks_CDF.pdf");
+    cCDF->SaveAs("./_root/SanityCheck_Wilks_CDF.root");
+
+    // --- CICLO DI ATTESA PER TENERLO APERTO ---
+    std::cout << "--> Grafico CDF pronto! Chiudi la finestra del CDF per proseguire." << std::endl;
+    while(gROOT->GetListOfCanvases()->FindObject("cCDF"))
+    {
+        gSystem->ProcessEvents();
+        gSystem->Sleep(50);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Wilks validation completed in " << elapsed.count() << " seconds." << std::endl;
+
+    // --- RIPRISTINO DELLO STATO GLOBALE DI ROOT ---
+    TF1::DefaultAddToGlobalList(kTRUE);
+
+    delete h_delta_F;
+    delete f_chi2_theory;
+    delete leg;
+    delete hPull;
+    delete line0;
+    delete cWilks;
 }

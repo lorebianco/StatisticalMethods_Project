@@ -54,7 +54,7 @@ inline void SetLBStyle()
     lbStyle->SetPadTopMargin(0.06); // Poco spazio sopra (niente titolo del plot)
     lbStyle->SetPadBottomMargin(0.14); // Spazio per il titolo asse X
     lbStyle->SetPadLeftMargin(0.16); // Spazio per il titolo asse Y (evita sovrapposizioni)
-    lbStyle->SetPadRightMargin(0.05); // Poco spazio a destra
+    lbStyle->SetPadRightMargin(0.08); // Poco spazio a destra
 
     // ---------------------------------------------------------
     // 3. Font

@@ -238,7 +238,10 @@ class analysis
     AuxFitResult FitTemplateMass(Int_t mcID);
     AuxFitResult FitCombinatorialBkg(bool usePol1 = false);
     void DoFullBlindedUnbinnedFit();
-    void RunToyMC(int nToys = 1e9);
+    std::pair<double, double> RunToyMC(int nToys, double true_fs, bool useBR = false);
+    void RunFeldmanCousinsPipeline(int nToysPerPoint, bool useBR = false);
+    void ConstructBelt(double sigma0, double alpha, double max_x_val, bool useBR = false);
+    void VerifyWilksTheorem(int nToys);
 
     // Helpers for blind analysis
     inline TH1D *GetBlindedClone(TH1D *h, Double_t blindMin, Double_t blindMax);
