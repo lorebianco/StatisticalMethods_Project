@@ -14,7 +14,9 @@
 
 #include <TChain.h>
 #include <TFile.h>
+#include <TGraph.h>
 #include <TH1D.h>
+#include <TLine.h>
 #include <TROOT.h>
 
 using namespace std;
@@ -26,6 +28,14 @@ struct AuxFitResult
     std::vector<Double_t> errors;
     std::vector<std::vector<Double_t>> covMatrix;
     bool isValid = false;
+};
+
+// User-defined struct for storing toy results
+struct ToyMetrics
+{
+    double bias_fs, res_fs;
+    double bias_br, res_br;
+    double bias_rtau, res_rtau;
 };
 
 // Header file for the classes stored in the TTree if any.
@@ -238,15 +248,28 @@ class analysis
     AuxFitResult FitTemplateMass(Int_t mcID);
     AuxFitResult FitCombinatorialBkg(bool usePol1 = false);
     void DoFullBlindedUnbinnedFit();
-    std::pair<double, double> RunToyMC(int nToys, double true_fs, bool useBR = false);
-    void RunFeldmanCousinsPipeline(int nToysPerPoint, bool useBR = false);
-    void ConstructBelt(double sigma0, double alpha, double max_x_val, bool useBR = false);
+    ToyMetrics RunToyMC(int nToys, double true_fs);
+    void RunFeldmanCousinsPipeline(int nToysPerPoint);
+    void ConstructBelt(double sigma0, double alpha, double max_x_val, int mode);
     void VerifyWilksTheorem(int nToys);
+
+    // Cut optimization
+    void CheckCut(const TString &cutString);
+    double EvaluateFOM(const TString &cutString);
+    TGraph *ScanVariable(const TString &baseline, const TString &varFormula, double start,
+        double stop, double step, double baseline_fom);
+    void OptimizeCuts();
+    void OptimizeAllParentCuts();
+    void StudyVertexCorrelations();
 
     // Helpers for blind analysis
     inline TH1D *GetBlindedClone(TH1D *h, Double_t blindMin, Double_t blindMax);
     inline void DrawBlindedFunction(
         TF1 *f, Double_t blindMin, Double_t blindMax, Option_t *option = "SAME");
+
+    // Nuovi membri per memorizzare i risultati del fit reale
+    std::vector<double> m_fitted_pars;
+    bool m_fit_done = false;
 };
 
 #endif

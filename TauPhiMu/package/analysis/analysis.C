@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +20,6 @@
 #include <TF1.h>
 #include <TFitResult.h>
 #include <TFitResultPtr.h>
-#include <TGraph.h>
 #include <TGraphErrors.h>
 #include <TH2.h>
 #include <TLegend.h>
@@ -29,6 +29,7 @@
 #include <TPaveStats.h>
 #include <TRandom3.h>
 #include <TStyle.h>
+#include <TTreeFormula.h>
 
 #include "analysis.h"
 #include "lbrootstyle.hh"
@@ -540,7 +541,7 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
     if(mcID == 42)
     {
         xMin = 1.60;
-        xMax = 1.98;
+        xMax = 2.0;
 
         binWidthTarget = 5e-3;
     }
@@ -879,8 +880,8 @@ void analysis::DoFullBlindedUnbinnedFit()
     cout << "\n=== [STEP 2/2] Preparing Real Data for Unbinned Fit ===" << endl;
     LoadDataset(0);
 
-    Double_t xMin = 1.65;
-    Double_t xMax = 2.09;
+    Double_t xMin = 1.6;
+    Double_t xMax = 2.10;
 
     g_data_events.clear();
     Long64_t nentries = fChain->GetEntries();
@@ -904,6 +905,8 @@ void analysis::DoFullBlindedUnbinnedFit()
             h_mass->Fill(D_M);
         }
     }
+    cout << "NEntries = " << h_mass->GetEntries() << endl;
+    cout << endl;
 
     Double_t binWidth = h_mass->GetBinWidth(1);
     Double_t nEntries = h_mass->GetEntries();
@@ -920,16 +923,16 @@ void analysis::DoFullBlindedUnbinnedFit()
     minimizer->SetFunction(fNLL);
 
     // Parametri primari (Frazioni e pendenza)
-    minimizer->SetVariable(0, "f_s", 0., 0.005);
-    minimizer->SetVariable(1, "f_1", 0.025, 0.010);
-    minimizer->SetVariable(2, "f_2", 0.051, 0.010);
-    minimizer->SetVariable(3, "f_3", 0.625, 0.020);
+    minimizer->SetVariable(0, "f_s", 0., 0.001);
+    minimizer->SetVariable(1, "f_1", 0.021, 0.001);
+    minimizer->SetVariable(2, "f_2", 0.043, 0.001);
+    minimizer->SetVariable(3, "f_3", 0.656, 0.001);
 
-    double init_slope = usePol1Bkg ? -1.14501 : -1.14501;
+    double init_slope = -0.932563;
     if(usePol1Bkg)
-        minimizer->SetVariable(4, "pol1_slope", init_slope, 0.05);
+        minimizer->SetVariable(4, "pol1_slope", init_slope, 0.001);
     else
-        minimizer->SetVariable(4, "expo_slope", init_slope, 0.1);
+        minimizer->SetVariable(4, "expo_slope", init_slope, 0.001);
 
     // Parametri 5-8: Segnale (Double Gauss)
     minimizer->SetVariable(5, "sig_mean", g_pdf_unbinned->m_sig_mean, 0.001);
@@ -986,6 +989,20 @@ void analysis::DoFullBlindedUnbinnedFit()
     cout << "\n--- Minimizing Unbinned Likelihood with MINUIT (Silenced) ---" << endl;
     minimizer->Minimize();
     minimizer->Hesse();
+
+    // --- NUOVA PARTE: Salvataggio dei parametri per i Toy ---
+    if(minimizer->Status() == 0)
+    {
+        const double *xs = minimizer->X();
+        unsigned int nDim = minimizer->NDim();
+        m_fitted_pars.assign(xs, xs + nDim);
+        m_fit_done = true;
+    }
+    else
+    {
+        cerr << "[WARNING] Full unbinned fit did not converge. Using fallback parameters." << endl;
+        m_fit_done = false;
+    }
 
     // 4. Stampa dei risultati
     cout << "\n=======================================================" << endl;
@@ -1556,7 +1573,7 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     return res;
 }
 
-std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool useBR)
+ToyMetrics analysis::RunToyMC(int nToys, double true_fs)
 {
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -1578,7 +1595,7 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
     if(!res_sig.isValid || !res_p1.isValid || !res_p2.isValid || !res_arg.isValid)
     {
         cerr << "[ERROR] Auxiliary fits failed! Aborting Toy MC." << endl;
-        return std::make_pair(0.0, 0.0);
+        return ToyMetrics {};
     }
 
     // --- [STEP 2] Stima delle efficienze dal Monte Carlo ---
@@ -1603,9 +1620,12 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
 
     double eff_sig = (double)n_pass_sig / n_gen_sig;
     double eff_norm = (double)n_pass_norm / n_gen_norm;
-    double r_eff = eff_norm / eff_sig;
 
-    // --- Formula binomiale esatta per l'incertezza del rapporto ---
+    // --- Calcolo errori binomiali individuali ---
+    double eff_sig_err = std::sqrt(eff_sig * (1.0 - eff_sig) / n_gen_sig);
+    double eff_norm_err = std::sqrt(eff_norm * (1.0 - eff_norm) / n_gen_norm);
+
+    double r_eff = eff_norm / eff_sig;
     double r_eff_err
         = r_eff * std::sqrt((1.0 - eff_sig) / n_pass_sig + (1.0 - eff_norm) / n_pass_norm);
 
@@ -1621,14 +1641,41 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
 
     double k_factor_nom = r_eff * (br_phimunu_nom / br_taunu_nom);
 
-    const double true_fs_val = true_fs;
-    const double true_f1 = 0.026;
-    const double true_f2 = 0.051;
-    const double true_f3 = 0.625;
-    const double true_slope = -1.145;
+    // --- Controllo dinamico del Fit reale ---
+    if(!m_fit_done || m_fitted_pars.size() < 5)
+    {
+        cout << "[INFO] Parametri del fit reale non trovati. Esecuzione automatica di "
+                "DoFullBlindedUnbinnedFit()..."
+             << endl;
+        DoFullBlindedUnbinnedFit();
+    }
+
+    // Verifichiamo nuovamente se adesso il fit è presente e valido
+    double true_fs_val = true_fs;
+    double true_f1, true_f2, true_f3, true_slope;
+
+    if(m_fit_done && m_fitted_pars.size() >= 5)
+    {
+        true_f1 = m_fitted_pars[1];
+        true_f2 = m_fitted_pars[2];
+        true_f3 = m_fitted_pars[3];
+        true_slope = m_fitted_pars[4];
+        cout << "[INFO] Toy MC inizializzato correttamente con i parametri del fit reale:" << endl;
+        cout << Form("  f1 = %.4f | f2 = %.4f | f3 = %.4f | slope = %.4f", true_f1, true_f2,
+            true_f3, true_slope)
+             << endl;
+    }
+    else
+    {
+        cerr << "[ERROR] Impossibile eseguire i Toy MC: il fit automatico sui dati reali ha "
+                "fallito o non è valido."
+             << endl;
+        return ToyMetrics {}; // Interrompe l'esecuzione restituendo una struttura vuota
+    }
 
     double true_est = true_fs_val / ((1.0 - true_fs_val) * true_f3);
     double true_br = true_est * k_factor_nom;
+    double true_rtau = true_est * r_eff;
 
     std::vector<double> gen_pars = { true_fs_val, true_f1, true_f2, true_f3, true_slope,
         res_sig.params[1], res_sig.params[2], res_sig.params[3], res_sig.params[4],
@@ -1636,8 +1683,8 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
         res_p2.params[2], res_p2.params[3], res_p2.params[4], res_arg.params[1], res_arg.params[2],
         res_arg.params[3] };
 
-    Double_t xMin = 1.65;
-    Double_t xMax = 2.09;
+    Double_t xMin = 1.60;
+    Double_t xMax = 2.10;
 
     FullUnbinnedPDF templatePdf(xMin, xMax, res_sig, res_p1, res_p2, res_arg, usePol1Bkg);
 
@@ -1681,16 +1728,16 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
         {
             toyResults.push_back(f.get());
         }
-        cout << "  Completed toys: " << toyResults.size() << " / " << nToys << "..." << endl;
+        cout << "\r  Completed toys: " << toyResults.size() << " / " << nToys << "..." << flush;
     }
 
     // --- [STEP 4] Booking Istogrammi ---
     // Istogrammi f_s
-    auto h_fit_fs = new TH1D("h_fit_fs", "Fitted f_{s};#Delta f_{s};Toys", 50, -0, 0);
+    auto h_fit_fs = new TH1D("h_fit_fs", "Fitted f_{s};#Deltaf_{s};Toys", 50, -0, 0);
     auto h_pull_fs = new TH1D("h_pull_fs", "Pull f_{s};Pull;Toys", 50, -5.0, 5.0);
 
     // Istogrammi per l'estimatore di resa grezzo Y = f_s / ((1 - f_s) * f_3)
-    auto h_fit_est = new TH1D("h_fit_est", "Fitted Yield Ratio Y;#Delta Y;Toys", 50, -0, 0);
+    auto h_fit_est = new TH1D("h_fit_est", "Fitted Yield Ratio Y;#DeltaY;Toys", 50, -0, 0);
     auto h_pull_est = new TH1D("h_pull_est", "Pull Yield Ratio Y;Pull;Toys", 50, -5.0, 5.0);
 
     // Istogrammi per il Branching Ratio fisico
@@ -1699,11 +1746,15 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
     auto h_pull_br = new TH1D(
         "h_pull_br", "Pull #f{B}(#tau^{+}#rightarrow#phi#mu^{+});Pull;Toys", 50, -5.0, 5.0);
 
+    // Istogrammi per R_tau
+    auto h_fit_rtau = new TH1D("h_fit_rtau", "Fitted R_{#tau};#Delta R_{#tau};Toys", 50, -0, 0);
+    auto h_pull_rtau = new TH1D("h_pull_rtau", "Pull R_{#tau};Pull;Toys", 50, -5.0, 5.0);
+
     // Altri parametri di background
-    auto h_fit_f1 = new TH1D("h_fit_f1", "Fitted f_{1};#Delta f_{1};Toys", 50, -0, 0);
-    auto h_fit_f2 = new TH1D("h_fit_f2", "Fitted f_{2};#Delta f_{2};Toys", 50, -0, 0);
-    auto h_fit_f3 = new TH1D("h_fit_f3", "Fitted f_{3};#Delta f_{3};Toys", 50, -0, 0);
-    auto h_fit_slope = new TH1D("h_fit_slope", "Fitted Slope;#Delta Slope;Toys", 50, -0, 0);
+    auto h_fit_f1 = new TH1D("h_fit_f1", "Fitted f_{1};#Deltaf_{1};Toys", 50, -0, 0);
+    auto h_fit_f2 = new TH1D("h_fit_f2", "Fitted f_{2};#Deltaf_{2};Toys", 50, -0, 0);
+    auto h_fit_f3 = new TH1D("h_fit_f3", "Fitted f_{3};#Deltaf_{3};Toys", 50, -0, 0);
+    auto h_fit_slope = new TH1D("h_fit_slope", "Fitted Slope;#DeltaSlope;Toys", 50, -0, 0);
 
     auto h_pull_f1 = new TH1D("h_pull_f1", "Pull f_{1};Pull;Toys", 50, -5.0, 5.0);
     auto h_pull_f2 = new TH1D("h_pull_f2", "Pull f_{2};Pull;Toys", 50, -5.0, 5.0);
@@ -1758,7 +1809,15 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
                 }
 
                 // Smearing dei parametri esterni per questo toy (Incertezze statistiche e PDG)
-                double r_eff_toy = mainRandom.Gaus(r_eff, r_eff_err);
+                double eff_sig_toy = mainRandom.Gaus(eff_sig, eff_sig_err);
+                double eff_norm_toy = mainRandom.Gaus(eff_norm, eff_norm_err);
+                // Impedisci fluttuazioni fisicamente impossibili sotto o uguale a zero
+                if(eff_sig_toy <= 0.0)
+                    eff_sig_toy = eff_sig;
+                if(eff_norm_toy <= 0.0)
+                    eff_norm_toy = eff_norm;
+
+                double r_eff_toy = eff_norm_toy / eff_sig_toy;
                 double br_phimunu_toy = mainRandom.Gaus(br_phimunu_nom, br_phimunu_err);
                 double br_taunu_toy = mainRandom.Gaus(br_taunu_nom, br_taunu_err);
 
@@ -1784,6 +1843,16 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
                     double br_err = std::sqrt(variance_br);
                     h_pull_br->Fill((br_val - true_br) / br_err);
                 }
+
+                // ==================== CALCOLO R_TAU ====================
+                double rtau_val = est_val * r_eff_toy;
+                h_fit_rtau->Fill(rtau_val - true_rtau);
+
+                // Varianza R_tau (ignora le B(D) del PDG!)
+                double variance_rtau
+                    = (r_eff * r_eff * variance_est) + (est_val * est_val * r_eff_err * r_eff_err);
+                if(variance_rtau > 0.0)
+                    h_pull_rtau->Fill((rtau_val - true_rtau) / std::sqrt(variance_rtau));
             }
         }
     }
@@ -1793,7 +1862,7 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
     TF1::DefaultAddToGlobalList(kTRUE);
 
     // --- [STEP 6] Disegno delle due Canvas richieste ---
-    auto drawResult = [](TVirtualPad *pad, TH1D *h, double trueVal)
+    auto drawResult = [](TVirtualPad *pad, TH1D *h)
     {
         pad->cd();
         h->SetStats(kTRUE);
@@ -1803,18 +1872,19 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
         gStyle->SetOptFit(111);
     };
 
-    // Canvas 1 aggiornata: fs, Yield Ratio (Y) e Branching Ratio (BR) disposti su 3 colonne
-    TCanvas *cMainEst
-        = new TCanvas("cMainEst", "Main Estimators (fs, Yield Ratio, BR)", 1500, 1000);
-    cMainEst->Divide(3, 2);
+    // Canvas 1 aggiornata
+    TCanvas *cMainEst = new TCanvas("cMainEst", "Estimators (fs, Y, BR, R_tau)", 1800, 900);
+    cMainEst->Divide(4, 2);
 
-    drawResult(cMainEst->GetPad(1), h_fit_fs, 0.0);
-    drawResult(cMainEst->GetPad(2), h_fit_est, 0.0);
-    drawResult(cMainEst->GetPad(3), h_fit_br, 0.0);
+    drawResult(cMainEst->GetPad(1), h_fit_fs);
+    drawResult(cMainEst->GetPad(2), h_fit_est);
+    drawResult(cMainEst->GetPad(3), h_fit_br);
+    drawResult(cMainEst->GetPad(4), h_fit_rtau);
 
-    drawResult(cMainEst->GetPad(4), h_pull_fs, 0.0);
-    drawResult(cMainEst->GetPad(5), h_pull_est, 0.0);
-    drawResult(cMainEst->GetPad(6), h_pull_br, 0.0);
+    drawResult(cMainEst->GetPad(5), h_pull_fs);
+    drawResult(cMainEst->GetPad(6), h_pull_est);
+    drawResult(cMainEst->GetPad(7), h_pull_br);
+    drawResult(cMainEst->GetPad(8), h_pull_rtau);
 
     cMainEst->Update();
     if(savePlots)
@@ -1827,15 +1897,15 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
     TCanvas *cOtherPars = new TCanvas("cOtherPars", "Other Fit Parameters", 1600, 800);
     cOtherPars->Divide(4, 2);
 
-    drawResult(cOtherPars->GetPad(1), h_fit_f1, 0.0);
-    drawResult(cOtherPars->GetPad(2), h_fit_f2, 0.0);
-    drawResult(cOtherPars->GetPad(3), h_fit_f3, 0.0);
-    drawResult(cOtherPars->GetPad(4), h_fit_slope, 0.0);
+    drawResult(cOtherPars->GetPad(1), h_fit_f1);
+    drawResult(cOtherPars->GetPad(2), h_fit_f2);
+    drawResult(cOtherPars->GetPad(3), h_fit_f3);
+    drawResult(cOtherPars->GetPad(4), h_fit_slope);
 
-    drawResult(cOtherPars->GetPad(5), h_pull_f1, 0.0);
-    drawResult(cOtherPars->GetPad(6), h_pull_f2, 0.0);
-    drawResult(cOtherPars->GetPad(7), h_pull_f3, 0.0);
-    drawResult(cOtherPars->GetPad(8), h_pull_slope, 0.0);
+    drawResult(cOtherPars->GetPad(5), h_pull_f1);
+    drawResult(cOtherPars->GetPad(6), h_pull_f2);
+    drawResult(cOtherPars->GetPad(7), h_pull_f3);
+    drawResult(cOtherPars->GetPad(8), h_pull_slope);
 
     cOtherPars->Update();
     if(savePlots)
@@ -2042,47 +2112,35 @@ std::pair<double, double> analysis::RunToyMC(int nToys, double true_fs, bool use
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Toy MC completed in " << elapsed.count() << " seconds." << std::endl;
 
-    // --- INTERRUTTORE DI RITORNO ---
-    if(useBR)
+    // Estrazione dei fit per l'algoritmo FC
+    ToyMetrics metrics;
+    auto getMetrics = [](TH1D *h, double &mean, double &sigma)
     {
-        double mean_br_fit = 0.0;
-        double sigma_br_fit = 0.0;
-        TFitResultPtr fitResBr = h_fit_br->Fit("gaus", "S L Q I N");
-        if(fitResBr.Get() && fitResBr->IsValid())
+        TF1 *fit = h->GetFunction("gaus");
+        if(fit)
         {
-            mean_br_fit = fitResBr->Parameter(1);
-            sigma_br_fit = fitResBr->Parameter(2);
+            mean = fit->GetParameter(1);
+            sigma = fit->GetParameter(2);
         }
         else
         {
-            mean_br_fit = h_fit_br->GetMean();
-            sigma_br_fit = h_fit_br->GetRMS();
+            cerr << "Warning: No fit found for histogram " << h->GetName() << endl;
+            mean = h->GetMean();
+            sigma = h->GetRMS();
         }
-        cout << Form("[TOY MC RESULT - BR mode] Mean Shift = %.5e, Sigma (Res) = %.5e", mean_br_fit,
-            sigma_br_fit)
-             << endl;
-        return std::make_pair(mean_br_fit, sigma_br_fit);
-    }
-    else
-    {
-        double mean_fs_fit = 0.0;
-        double sigma_fs_fit = 0.0;
-        TFitResultPtr fitResFs = h_fit_fs->Fit("gaus", "S L Q I N");
-        if(fitResFs.Get() && fitResFs->IsValid())
-        {
-            mean_fs_fit = fitResFs->Parameter(1);
-            sigma_fs_fit = fitResFs->Parameter(2);
-        }
-        else
-        {
-            mean_fs_fit = h_fit_fs->GetMean();
-            sigma_fs_fit = h_fit_fs->GetRMS();
-        }
-        cout << Form("[TOY MC RESULT - fs mode] Mean Shift = %.5e, Sigma (Res) = %.5e", mean_fs_fit,
-            sigma_fs_fit)
-             << endl;
-        return std::make_pair(mean_fs_fit, sigma_fs_fit);
-    }
+    };
+
+    getMetrics(h_fit_fs, metrics.bias_fs, metrics.res_fs);
+    getMetrics(h_fit_br, metrics.bias_br, metrics.res_br);
+    getMetrics(h_fit_rtau, metrics.bias_rtau, metrics.res_rtau);
+
+    cout << Form(
+        "[TOY MC] f_s: Bias=%.2e, Res=%.2e | BR: Bias=%.2e, Res=%.2e | R_tau: Bias=%.2e, Res=%.2e",
+        metrics.bias_fs, metrics.res_fs, metrics.bias_br, metrics.res_br, metrics.bias_rtau,
+        metrics.res_rtau)
+         << endl;
+
+    return metrics;
 }
 
 // ================================================================================
@@ -2102,7 +2160,7 @@ struct FCPoint
     }
 };
 
-void analysis::ConstructBelt(double sigma0, double alpha, double max_val, bool useBR)
+void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mode)
 {
     SetLBStyle();
 
@@ -2115,9 +2173,7 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, bool u
     int n_steps = 200; // Numero di punti per rendere la curva liscia
     double mu_step = (mu_end - mu_start) / n_steps;
 
-    std::vector<double> vec_mu;
-    std::vector<double> vec_x_lower;
-    std::vector<double> vec_x_upper;
+    std::vector<double> vec_mu, vec_x_lower, vec_x_upper;
 
     cout << "\n--> Constructing Feldman-Cousins Belt Boundaries (" << (target_CL * 100)
          << "% CL)..." << endl;
@@ -2133,7 +2189,7 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, bool u
 
         for(double x = x_start; x <= x_end; x += dx)
         {
-            double par[3] = { mu, sigma0, alpha }; // Ora passi anche alpha e sigma0!
+            double par[3] = { mu, sigma0, alpha };
             double prob_density = TMath::Gaus(x, mu, sigma_mu, kTRUE);
             double R = LROrdering(&x, par);
 
@@ -2196,256 +2252,221 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, bool u
         mu_closed.push_back(vec_mu[i]);
     }
 
-    TGraph *g_belt_filled = new TGraph(x_closed.size(), &x_closed[0], &mu_closed[0]);
-    if(useBR)
-        g_belt_filled->SetFillColorAlpha(kGreen - 9, 0.35);
-    else
-        g_belt_filled->SetFillColorAlpha(kBlue - 9, 0.35);
-    g_belt_filled->SetLineWidth(0);
+    TGraph *g_belt = new TGraph(x_closed.size(), &x_closed[0], &mu_closed[0]);
+    TGraph *g_up = new TGraph(nPoints, &vec_x_lower[0], &vec_mu[0]);
+    TGraph *g_low = new TGraph(nPoints, &vec_x_upper[0], &vec_mu[0]);
 
-    TGraph *g_upperEdge = new TGraph(nPoints, &vec_x_lower[0], &vec_mu[0]);
-    TGraph *g_lowerEdge = new TGraph(nPoints, &vec_x_upper[0], &vec_mu[0]);
-    if(useBR)
+    TString titleX, titleY, nameSuffix;
+    int colBase;
+
+    if(mode == 0)
     {
-        g_upperEdge->SetLineColor(kGreen + 1);
-        g_lowerEdge->SetLineColor(kGreen + 1);
+        titleX = "Measured #hat{f}_{s}";
+        titleY = "True f_{s}";
+        nameSuffix = "fs";
+        colBase = kBlue;
+    }
+    else if(mode == 1)
+    {
+        titleX = "Measured #hat{#font[12]{B}}(#tau^{+}#rightarrow#phi#mu^{+})";
+        titleY = "True #font[12]{B}";
+        nameSuffix = "BR";
+        colBase = kGreen;
     }
     else
     {
-        g_upperEdge->SetLineColor(kBlue + 1);
-        g_lowerEdge->SetLineColor(kBlue + 1);
+        titleX = "Measured #hat{R}_{#tau}";
+        titleY = "True R_{#tau}";
+        nameSuffix = "Rtau";
+        colBase = kOrange + 1;
     }
-    g_upperEdge->SetLineWidth(3);
-    g_lowerEdge->SetLineWidth(3);
 
-    TString canvasName = useBR ? "cBeltBR" : "cBelt_fs";
-    TCanvas *cBelt = new TCanvas(canvasName, "Feldman-Cousins Confidence Belt", 800, 800);
+    g_belt->SetFillColorAlpha(colBase - 9, 0.35);
+    g_belt->SetLineWidth(0);
+    g_up->SetLineColor(colBase + 1);
+    g_low->SetLineColor(colBase + 1);
+    g_up->SetLineWidth(3);
+    g_low->SetLineWidth(3);
+
+    TCanvas *cBelt
+        = new TCanvas(Form("cBelt_%s", nameSuffix.Data()), "Feldman-Cousins Belt", 800, 800);
     cBelt->cd();
     cBelt->SetGrid();
 
     double plot_x_min = -3.0 * sigma0;
     double plot_x_max = mu_end + 3.0 * sigma0;
 
-    TString titleX = useBR ? "Measured #hat{#font[12]{B}}(#tau^{+}#rightarrow#phi#mu^{+})"
-                           : "Measured #hat{f}_{s}";
-    TString titleY = useBR ? "True #font[12]{B}(#tau^{+}#rightarrow#phi#mu^{+})" : "True f_{s}";
-    TString frameTitle
-        = Form("Feldman-Cousins Confidence Belt (90%% CL);%s;%s", titleX.Data(), titleY.Data());
-
-    TH2F *hFrame = new TH2F("hFrame", frameTitle, 100, plot_x_min, plot_x_max, 100, 0.0, mu_end);
+    TH2F *hFrame = new TH2F(Form("hFrame_%s", nameSuffix.Data()),
+        Form("FC Belt 90%% CL (%s);%s;%s", nameSuffix.Data(), titleX.Data(), titleY.Data()), 100,
+        plot_x_min, plot_x_max, 100, 0.0, mu_end);
     hFrame->SetStats(0);
     hFrame->Draw();
 
-    g_belt_filled->Draw("F SAME");
-    g_upperEdge->Draw("L SAME");
-    g_lowerEdge->Draw("L SAME");
+    g_belt->Draw("F SAME");
+    g_up->Draw("L SAME");
+    g_low->Draw("L SAME");
 
     TLine *diag = new TLine(0.0, 0.0, mu_end, mu_end);
     diag->SetLineStyle(2);
     diag->SetLineColor(kGray + 2);
     diag->Draw("SAME");
-
-    TLine *vert_zero = new TLine(0.0, 0.0, 0.0, mu_end);
-    vert_zero->SetLineStyle(3);
-    vert_zero->SetLineColor(kBlack);
-    vert_zero->Draw("SAME");
+    TLine *vert = new TLine(0.0, 0.0, 0.0, mu_end);
+    vert->SetLineStyle(3);
+    vert->SetLineColor(kBlack);
+    vert->Draw("SAME");
 
     cBelt->Update();
-
-    TString saveName_fig
-        = useBR ? "./_fig/FeldmanCousinsBelt_BR_Filled" : "./_fig/FeldmanCousinsBelt_fs_Filled";
-    cBelt->SaveAs(saveName_fig + ".pdf");
-    TString saveName_root
-        = useBR ? "./_root/FeldmanCousinsBelt_BR_Filled" : "./_root/FeldmanCousinsBelt_fs_Filled";
-    cBelt->SaveAs(saveName_root + ".root");
-
+    if(savePlots)
+    {
+        cBelt->SaveAs(Form("./_fig/FeldmanCousinsBelt_%s.pdf", nameSuffix.Data()));
+        cBelt->SaveAs(Form("./_root/FeldmanCousinsBelt_%s.root", nameSuffix.Data()));
+    }
     cout << "Filled Belt (90% CL) successfully generated and saved!" << endl;
 }
 
-void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint, bool useBR)
+void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint)
 {
     cout << "\n=======================================================" << endl;
-    cout << Form("   STARTING AUTOMATED FELDMAN-COUSINS PIPELINE (%s mode)", useBR ? "BR" : "fs")
-         << endl;
+    cout << "      STARTING AUTOMATED FELDMAN-COUSINS PIPELINE      " << endl;
     cout << "=======================================================" << endl;
+    // --- Controllo dinamico del Fit reale ---
+    if(!m_fit_done || m_fitted_pars.size() < 4)
+    {
+        cout << "[INFO] Parametri del fit reale non trovati per la pipeline. Esecuzione automatica "
+                "di DoFullBlindedUnbinnedFit()..."
+             << endl;
+        DoFullBlindedUnbinnedFit();
+    }
+
+    double true_f3;
+    if(m_fit_done && m_fitted_pars.size() >= 4)
+    {
+        true_f3 = m_fitted_pars[3];
+        cout << "[INFO] Pipeline Feldman-Cousins configurata con f3 reale = " << true_f3 << endl;
+    }
+    else
+    {
+        cerr << "[ERROR] Impossibile avviare la pipeline FC: il fit automatico ha fallito." << endl;
+        return; // Interrompe la pipeline
+    }
 
     // Fattori nominali costanti
     double r_eff = 0.2212;
     const double br_taunu_nom = 5.39e-2;
     const double br_phimunu_nom = 2.24e-2;
     double k_factor_nom = r_eff * (br_phimunu_nom / br_taunu_nom);
-    double true_f3 = 0.625;
 
-    // Definiamo i punti nominali su f_s (generiamo SEMPRE a partire da qui)
-    std::vector<double> fs_points = { 0.0, 0.0025, 0.0050, 0.0075, 0.0100 };
+    // Definiamo i punti nominali su f_s dinamicamente con un ciclo
+    std::vector<double> fs_points;
 
-    std::vector<double> x_true;
-    std::vector<double> y_sigma;
-    std::vector<double> y_bias; // Salveremo il bias (mean shift) di ciascun punto
+    double fs_start = 0.0;
+    double fs_end = 0.01;
+    double fs_step = 0.0010;
+    int n_steps = std::round((fs_end - fs_start) / fs_step) + 1;
+    for(int i = 0; i < n_steps; ++i)
+        fs_points.push_back(fs_start + i * fs_step);
+
+    std::vector<double> xt_fs, xt_br, xt_rtau;
+    std::vector<double> yb_fs, ys_fs, yb_br, ys_br, yb_rtau, ys_rtau;
 
     for(double fs : fs_points)
     {
-        // 1. Calcolo esatto del BR equivalente
-        double true_br = (fs / ((1.0 - fs) * true_f3)) * k_factor_nom;
+        double true_est = fs / ((1.0 - fs) * true_f3);
+        double true_br = true_est * k_factor_nom;
+        double true_rtau = true_est * r_eff;
 
-        if(useBR)
-            cout << Form("\n--> Running Toy: true_fs = %.4f => true_BR = %.2e", fs, true_br)
-                 << endl;
-        else
-            cout << Form("\n--> Running Toy: true_fs = %.4f", fs) << endl;
+        cout << Form("\n--> Initiating Toy Block for true_fs = %.4f (BR = %.2e, R_tau = %.2e)", fs,
+            true_br, true_rtau)
+             << endl;
 
-        // 2. Lancio del Toy (restituisce la coppia <mean_shift, sigma>)
-        auto results = RunToyMC(nToysPerPoint, fs, useBR);
-        double bias_misurato = results.first;
-        double sigma_misurata = results.second;
+        ToyMetrics m = RunToyMC(nToysPerPoint, fs); // <--- Genera una sola volta per punto!
 
-        // 3. Salviamo le coordinate per i fit e i controlli
-        if(useBR)
+        xt_fs.push_back(fs);
+        yb_fs.push_back(m.bias_fs);
+        ys_fs.push_back(m.res_fs);
+        xt_br.push_back(true_br);
+        yb_br.push_back(m.bias_br);
+        ys_br.push_back(m.res_br);
+        xt_rtau.push_back(true_rtau);
+        yb_rtau.push_back(m.bias_rtau);
+        ys_rtau.push_back(m.res_rtau);
+    }
+
+    // Lambda helper per elaborare le singole liste generando Fit, Control Plot e Belt
+    auto processBeltMetrics
+        = [&](const std::vector<double> &x, const std::vector<double> &b,
+              const std::vector<double> &s, int mode, double scale, const char *name)
+    {
+        cout << "\n--- Processing Belts for " << name << " ---" << endl;
+        double max_x = x.back();
+
+        std::vector<double> xs(x.size()), ys(s.size());
+        for(size_t i = 0; i < x.size(); ++i)
         {
-            x_true.push_back(true_br);
+            xs[i] = x[i] * scale;
+            ys[i] = s[i] * scale;
         }
-        else
+
+        TGraph *g_res = new TGraph(xs.size(), &xs[0], &ys[0]);
+        TF1 *f_lin = new TF1(Form("f_lin_%d", mode), "[0] + [1]*x", 0.0, max_x * scale * 1.2);
+        f_lin->SetParameters(ys[0], 0.0);
+        g_res->Fit(f_lin, "Q");
+
+        double sigma0 = f_lin->GetParameter(0) / scale;
+        double alpha = f_lin->GetParameter(1);
+
+        cout << Form("    Resolution: sigma(X) = %.5e + %.5f * X", sigma0, alpha) << endl;
+
+        // 1) Plot Sanity Risoluzione
+        TCanvas *cRes = new TCanvas(Form("cRes_%d", mode), Form("Res %s", name), 600, 500);
+        cRes->SetGrid();
+        TGraphErrors *ge_res = new TGraphErrors(x.size());
+        for(size_t i = 0; i < x.size(); ++i)
         {
-            x_true.push_back(fs);
+            ge_res->SetPoint(i, x[i], s[i]);
+            ge_res->SetPointError(i, 0, s[i] / std::sqrt(2.0 * nToysPerPoint));
         }
-        y_sigma.push_back(sigma_misurata);
-        y_bias.push_back(bias_misurato);
-    }
+        ge_res->SetMarkerStyle(20);
+        ge_res->SetTitle(Form("Resolution %s", name));
+        ge_res->Draw("AP");
+        TF1 *f_phys = new TF1(Form("f_phys_%d", mode), "[0] + [1]*x", 0.0, max_x * 1.2);
+        f_phys->SetParameters(sigma0, alpha);
+        f_phys->SetLineColor(kRed);
+        f_phys->Draw("SAME");
+        if(savePlots)
+            cRes->SaveAs(Form("./_fig/SanityCheck_Res_%s.pdf", name));
 
-    // Valore massimo dell'asse X per disegnare correttamente la banda
-    double max_x_val = x_true.back();
+        // 2) Plot Sanity Bias
+        TCanvas *cBias = new TCanvas(Form("cBias_%d", mode), Form("Bias %s", name), 600, 500);
+        cBias->SetGrid();
+        TGraphErrors *ge_bias = new TGraphErrors(x.size());
+        for(size_t i = 0; i < x.size(); ++i)
+        {
+            ge_bias->SetPoint(i, x[i], b[i]);
+            ge_bias->SetPointError(i, 0, s[i] / std::sqrt(nToysPerPoint));
+        }
+        ge_bias->SetMarkerStyle(21);
+        ge_bias->SetTitle(Form("Bias %s", name));
+        ge_bias->Draw("AP");
+        TLine *lz = new TLine(0.0, 0.0, max_x * 1.2, 0.0);
+        lz->SetLineColor(kRed);
+        lz->Draw("SAME");
+        if(savePlots)
+            cBias->SaveAs(Form("./_fig/SanityCheck_Bias_%s.pdf", name));
 
-    // --- FIT DELLA RISOLUZIONE (USANDO LE VARIABILI RISCALATE PER MINUIT) ---
-    double scale = useBR ? 1e7 : 1e3;
-    std::vector<double> x_scaled(x_true.size());
-    std::vector<double> y_scaled(y_sigma.size());
+        // 3) Costruzione FC
+        ConstructBelt(sigma0, alpha, max_x, mode);
+    };
 
-    for(size_t i = 0; i < x_true.size(); ++i)
-    {
-        x_scaled[i] = x_true[i] * scale;
-        y_scaled[i] = y_sigma[i] * scale;
-    }
+    // Chiama la Pipeline per tutte e 3 le metriche (impostando le scale di conversione corrette per
+    // Minuit)
+    processBeltMetrics(xt_fs, yb_fs, ys_fs, 0, 1e3, "fs");
+    processBeltMetrics(xt_br, yb_br, ys_br, 1, 1e7, "BR");
+    processBeltMetrics(xt_rtau, yb_rtau, ys_rtau, 2, 1e4, "Rtau");
 
-    TGraph *g_res = new TGraph(x_scaled.size(), &x_scaled[0], &y_scaled[0]);
-    TF1 *f_linear = new TF1("f_linear", "[0] + [1]*x", 0.0, max_x_val * scale * 1.2);
-
-    f_linear->SetParameters(y_scaled[0], 0.0);
-    cout << "\n--> Fitting resolution dependency..." << endl;
-    g_res->Fit(f_linear, "Q");
-
-    double sigma0 = f_linear->GetParameter(0) / scale;
-    double alpha = f_linear->GetParameter(1);
-
+    cout << "\n=======================================================" << endl;
+    cout << "  PIPELINE FELDMAN COUSINS (FS, BR, R_TAU) COMPLETED!  " << endl;
     cout << "=======================================================" << endl;
-    cout << Form("   FIT RESULTS FOR RESOLUTION FUNCTION sigma(%s):", useBR ? "BR" : "fs") << endl;
-    cout << Form("   sigma(X) = %.5e + %.5f * X", sigma0, alpha) << endl;
-    cout << "=======================================================" << endl;
-
-    // =========================================================================
-    // SANITY CHECK 1: COMPORTAMENTO DELLA RISOLUZIONE (PLOT FISICO)
-    // =========================================================================
-    TCanvas *cResCheck = new TCanvas("cResCheck", "Resolution Sanity Check", 800, 600);
-    cResCheck->SetGrid();
-
-    TGraphErrors *g_res_physical = new TGraphErrors(x_true.size());
-    for(size_t i = 0; i < x_true.size(); ++i)
-    {
-        g_res_physical->SetPoint(i, x_true[i], y_sigma[i]);
-        // Incertezza statistica della sigma stimata dai Toy: sigma / sqrt(2*N)
-        double err_y = y_sigma[i] / std::sqrt(2.0 * nToysPerPoint);
-        g_res_physical->SetPointError(i, 0.0, err_y);
-    }
-
-    g_res_physical->SetMarkerStyle(20);
-    g_res_physical->SetMarkerSize(1.2);
-    g_res_physical->SetMarkerColor(kBlue + 1);
-    g_res_physical->SetLineColor(kBlue + 1);
-
-    TString titleX = useBR ? "True B(#tau^{+}#rightarrow#phi#mu^{+})" : "True f_{s}";
-    TString titleY = useBR ? "#sigma(B)" : "#sigma(f_{s})";
-    g_res_physical->SetTitle(Form("Resolution Fit;%s;%s", titleX.Data(), titleY.Data()));
-    g_res_physical->GetXaxis()->SetMaxDigits(3);
-    g_res_physical->GetYaxis()->SetMaxDigits(3);
-    g_res_physical->Draw("AP");
-
-    // Sovrapponiamo la funzione lineare con i parametri de-scalati corretti
-    TF1 *f_phys = new TF1("f_phys", "[0] + [1]*x", 0.0, max_x_val * 1.2);
-    f_phys->SetParameters(sigma0, alpha);
-    f_phys->SetLineColor(kRed);
-    f_phys->SetLineWidth(3);
-    f_phys->Draw("SAME");
-
-    TPaveText *paveRes = new TPaveText(0.15, 0.72, 0.45, 0.88, "NDC");
-    paveRes->SetBorderSize(1);
-    paveRes->SetFillColor(kWhite);
-    paveRes->SetTextFont(42);
-    paveRes->SetTextSize(0.03);
-    paveRes->AddText(Form("#sigma_{0} = %.3e", sigma0));
-    paveRes->AddText(Form("#alpha = %.4f", alpha));
-    paveRes->Draw();
-
-    cResCheck->Update();
-    cResCheck->SaveAs(
-        useBR ? "./_fig/SanityCheck_Resolution_BR.pdf" : "./_fig/SanityCheck_Resolution_fs.pdf");
-
-    // =========================================================================
-    // SANITY CHECK 2: COMPORTAMENTO DEL BIAS (COERENTE CON ZERO)
-    // =========================================================================
-    TCanvas *cBiasCheck = new TCanvas("cBiasCheck", "Bias Sanity Check", 800, 600);
-    cBiasCheck->SetGrid();
-
-    TGraphErrors *g_bias_physical = new TGraphErrors(x_true.size());
-    for(size_t i = 0; i < x_true.size(); ++i)
-    {
-        g_bias_physical->SetPoint(i, x_true[i], y_bias[i]);
-        // Errore statistico del valor medio (errore sulla media dei Toy): sigma_toy / sqrt(N_toy)
-        double err_y = y_sigma[i] / std::sqrt(nToysPerPoint);
-        g_bias_physical->SetPointError(i, 0.0, err_y);
-    }
-
-    g_bias_physical->SetMarkerStyle(21);
-    g_bias_physical->SetMarkerSize(1.2);
-    g_bias_physical->SetMarkerColor(kBlack);
-    g_bias_physical->SetLineColor(kBlack);
-
-    TString titleY_bias = useBR ? "Bias: Fitted B - True B" : "Bias: Fitted f_{s} - True f_{s}";
-    g_bias_physical->SetTitle(Form("Bias Check;%s;%s", titleX.Data(), titleY_bias.Data()));
-    g_bias_physical->GetXaxis()->SetMaxDigits(3);
-    g_bias_physical->GetYaxis()->SetMaxDigits(3);
-
-    // Impostiamo l'asse Y simmetrico intorno a 0 per una visualizzazione ottimale del bias
-    double max_err = 0.0;
-    for(size_t i = 0; i < x_true.size(); ++i)
-    {
-        double val = std::abs(y_bias[i]) + 3.0 * (y_sigma[i] / std::sqrt(nToysPerPoint));
-        if(val > max_err)
-            max_err = val;
-    }
-    g_bias_physical->SetMinimum(-max_err);
-    g_bias_physical->SetMaximum(max_err);
-    g_bias_physical->Draw("AP");
-
-    // Disegnamo la linea dello zero teorico (nessun bias)
-    TLine *lZero = new TLine(0.0, 0.0, max_x_val * 1.2, 0.0);
-    lZero->SetLineStyle(2);
-    lZero->SetLineColor(kRed);
-    lZero->SetLineWidth(2);
-    lZero->Draw("SAME");
-
-    cBiasCheck->Update();
-    cBiasCheck->SaveAs(useBR ? "./_fig/SanityCheck_Bias_BR.pdf" : "./_fig/SanityCheck_Bias_fs.pdf");
-
-    // 4. Costruzione geometrica finale della Belt
-    ConstructBelt(sigma0, alpha, max_x_val, useBR);
-
-    delete g_res;
-    delete f_linear;
-    delete g_res_physical;
-    delete f_phys;
-    delete cResCheck;
-    delete g_bias_physical;
-    delete lZero;
-    delete cBiasCheck;
 }
 
 // ================================================================================
@@ -2611,8 +2632,8 @@ void analysis::VerifyWilksTheorem(int nToys)
         res_p1.params[3], res_p1.params[4], res_p2.params[1], res_p2.params[2], res_p2.params[3],
         res_p2.params[4], res_arg.params[1], res_arg.params[2], res_arg.params[3] };
 
-    Double_t xMin = 1.65;
-    Double_t xMax = 2.09;
+    Double_t xMin = 1.60;
+    Double_t xMax = 2.10;
     FullUnbinnedPDF templatePdf(xMin, xMax, res_sig, res_p1, res_p2, res_arg, usePol1Bkg);
 
     // Conteggio eventi totali dai dati reali
@@ -2905,4 +2926,729 @@ void analysis::VerifyWilksTheorem(int nToys)
     delete hPull;
     delete line0;
     delete cWilks;
+}
+
+// ================================================================================
+// CheckCut: Utility to test offline selection cuts on BLINDED Real Data
+// ================================================================================
+
+// ==========================================================
+// 1. Tagli sui due candidati Kaoni (h1 e h2)
+// ==========================================================
+const TString cut_kaons = "(h1_pt > 0.450 && h2_pt > 0.450) && "
+                          "(h1_p > 3.0 && h2_p > 3.0) && "
+                          "(h1_eta > 2.0 && h1_eta < 4.2) && (h2_eta > 2.0 && h2_eta < 4.2) && "
+                          "(h1_IP > 60e-6 && h2_IP > 60e-6)";
+
+// ==========================================================
+// 2. Tagli sul candidato Muone (h3)
+// ==========================================================
+const TString cut_muon = "h3_pt > 0.350 && h3_p > 3.0 && "
+                         "(h3_eta > 2.0 && h3_eta < 4.2) && "
+                         "h3_IP > 90e-6 && h3_MuonID == 1";
+
+// ==========================================================
+// 3. Tagli sulla risonanza intermedia Phi (M0)
+// ==========================================================
+const TString cut_phi = "M0_pt > 0.9";
+
+// ==========================================================
+// 4. Tagli sul parent 3-corpi tau/D (D)
+// ==========================================================
+const TString cut_parent = "D_pt > 2.5 && D_time > 0.25e-12 && (D_M > 1.6 && D_M < 2.1)";
+
+// ==========================================================
+// TAGLIO COMBINATO (BASELINE DEL PDF TAB. 2)
+// ==========================================================
+const TString cut_baseline = cut_kaons + " && " + cut_muon + " && " + cut_phi + " && " + cut_parent;
+
+void analysis::CheckCut(const TString &cutString)
+{
+    SetLBStyle(); // Applica il tuo stile
+
+    cout << "\n=======================================================" << endl;
+    cout << "   TESTING CUT: " << cutString << endl;
+    cout << "=======================================================" << endl;
+
+    // 1. Carica i dati reali
+    LoadDataset(0);
+    if(!fChain)
+    {
+        cerr << "[ERROR] fChain is null!" << endl;
+        return;
+    }
+
+    // 2. Definisci il range e la regione di blinding
+    Double_t xMin = 1.60;
+    Double_t xMax = 2.10;
+    Double_t blindMin = 1.777 - 3 * 0.0058;
+    Double_t blindMax = 1.777 + 3 * 0.0058;
+
+    auto h_before = new TH1D(
+        "h_before_cut", "Before Cut;M(D_{s}^{+}) [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
+    auto h_after = new TH1D(
+        "h_after_cut", "After Cut;M(D_{s}^{+}) [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
+
+    h_before->SetDirectory(nullptr);
+    h_after->SetDirectory(nullptr);
+    AddBinSizeOnYTitle(h_before, "GeV/#it{c}^{2}");
+
+    // 3. TTreeFormula per interpretare la stringa di taglio al volo
+    // TTreeFormula richiede un const char*, quindi usiamo .Data() sulla nostra TString
+    TTreeFormula formula("cutFormula", cutString.Data(), fChain);
+    if(formula.GetNdim() == 0)
+    {
+        cerr << "[ERROR] Invalid cut string provided!" << endl;
+        return;
+    }
+
+    // 4. Loop sugli eventi
+    Int_t currentTreeNumber = -1;
+    Long64_t nentries = fChain->GetEntriesFast();
+
+    int evts_before_sideband = 0;
+    int evts_after_sideband = 0;
+
+    for(Long64_t jentry = 0; jentry < nentries; jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+
+        // Necessario per TTreeFormula quando si usa una TChain (file multipli)
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formula.UpdateFormulaLeaves();
+        }
+
+        fChain->GetEntry(jentry);
+
+        // Assicuriamoci di guardare solo i dati reali
+        if(id != 0)
+            continue;
+
+        // Limita l'analisi al range di massa di interesse
+        if(D_M < xMin || D_M > xMax)
+            continue;
+
+        bool is_sideband = (D_M < blindMin || D_M > blindMax);
+
+        // Prima del taglio
+        h_before->Fill(D_M);
+        if(is_sideband)
+            evts_before_sideband++;
+
+        // Valuta la condizione di taglio
+        if(formula.EvalInstance() > 0)
+        {
+            h_after->Fill(D_M);
+            if(is_sideband)
+                evts_after_sideband++;
+        }
+    }
+
+    // 5. Applica la maschera di Blinding
+    TH1D *h_before_blind = GetBlindedClone(h_before, blindMin, blindMax);
+    TH1D *h_after_blind = GetBlindedClone(h_after, blindMin, blindMax);
+
+    // 6. Stile grafico
+    h_before_blind->SetLineColor(kBlack);
+    h_before_blind->SetMarkerColor(kBlack);
+    h_before_blind->SetMarkerStyle(20);
+    h_before_blind->SetMarkerSize(0.8);
+
+    h_after_blind->SetLineColor(kRed);
+    h_after_blind->SetMarkerColor(kRed);
+    h_after_blind->SetMarkerStyle(21);
+    h_after_blind->SetMarkerSize(0.8);
+    h_after_blind->SetFillColorAlpha(kRed, 0.3);
+
+    // 7. Disegno
+    TCanvas *cCut = new TCanvas("cCut", "Cut Effect Validation", 800, 600);
+    cCut->cd();
+
+    double max_y = h_before_blind->GetMaximum() * 1.3;
+    h_before_blind->SetMaximum(max_y);
+    h_before_blind->SetMinimum(0.0);
+    h_before_blind->SetStats(0); // Rimuove la stat box per pulizia visiva
+
+    h_before_blind->Draw("E");
+    h_after_blind->Draw("HIST SAME"); // Istogramma colorato
+    h_after_blind->Draw("E SAME"); // Più i punti con errore
+
+    // Disegna le linee rosse per delimitare l'area blinded
+    TLine *l1 = new TLine(blindMin, 0, blindMin, max_y);
+    TLine *l2 = new TLine(blindMax, 0, blindMax, max_y);
+    l1->SetLineStyle(2);
+    l1->SetLineColor(kGray + 2);
+    l2->SetLineStyle(2);
+    l2->SetLineColor(kGray + 2);
+    l1->Draw("SAME");
+    l2->Draw("SAME");
+
+    // 8. Legenda e metriche
+    // Uso una stringa troncata per la legenda se il taglio è troppo lungo (evita che sbordi)
+    TString legendCutName = cutString;
+    if(legendCutName.Length() > 40)
+    {
+        legendCutName.Remove(37);
+        legendCutName += "...";
+    }
+
+    TLegend *leg = new TLegend(0.15, 0.75, 0.55, 0.88);
+    leg->SetBorderSize(0);
+    leg->SetFillStyle(0);
+    leg->SetTextFont(42);
+    leg->AddEntry(h_before_blind, "Data (Before Cut)", "lep");
+    leg->AddEntry(h_after_blind, Form("Cut: %s", legendCutName.Data()), "flep");
+    leg->Draw("SAME"); // Ora de-commentato e sicuro!
+
+    double bkg_retention = (evts_before_sideband > 0)
+        ? (double)evts_after_sideband / evts_before_sideband * 100.0
+        : 0.0;
+
+    TPaveText *pt = new TPaveText(0.58, 0.70, 0.92, 0.88, "NDC");
+    pt->SetBorderSize(1);
+    pt->SetFillColor(kWhite);
+    pt->SetTextFont(42);
+    pt->SetTextAlign(12);
+    pt->AddText(Form("Sideband Evts (Before): %d", evts_before_sideband));
+    pt->AddText(Form("Sideband Evts (After):  %d", evts_after_sideband));
+    pt->AddText(Form("Bkg Retention:          %.1f%%", bkg_retention));
+    pt->Draw("SAME");
+
+    cCut->Update();
+
+    // Pulizia stringa per il nome del file usando i metodi nativi TString
+    TString safeName = cutString;
+    safeName.ReplaceAll(" ", "");
+    safeName.ReplaceAll(">", "GT");
+    safeName.ReplaceAll("<", "LT");
+    safeName.ReplaceAll("=", "EQ");
+    safeName.ReplaceAll("&", "AND");
+    safeName.ReplaceAll("|", "OR");
+    safeName.ReplaceAll(".", "p");
+    safeName.ReplaceAll("-", "m");
+    safeName.ReplaceAll("(", "");
+    safeName.ReplaceAll(")", "");
+
+    // Taglia a 50 caratteri per evitare nomi file illegali per il Sistema Operativo
+    if(safeName.Length() > 50)
+        safeName.Remove(50);
+
+    if(savePlots)
+    {
+        cCut->SaveAs(Form("./_fig/CheckCut_%s.pdf", safeName.Data()));
+    }
+
+    cout << "  Cut efficiency on Background (Sidebands): " << bkg_retention << "%" << endl;
+    cout << "=======================================================\n" << endl;
+
+    // Cleanup mem
+    delete h_before;
+    delete h_after;
+}
+
+// ================================================================================
+// EvaluateFOM: Calculates Signal Efficiency over Sqrt(Bkg)
+// ================================================================================
+double analysis::EvaluateFOM(const TString &cutString)
+{
+    // Regioni di massa
+    Double_t xMin = 1.65;
+    Double_t xMax = 2.09;
+    Double_t blindMin = 1.777 - 3 * 0.0058;
+    Double_t blindMax = 1.777 + 3 * 0.0058;
+
+    // 1. STIMA DEL BACKGROUND (B) DAI DATI REALI (Sidebands)
+    LoadDataset(0);
+    TTreeFormula formulaData("cutData", cutString.Data(), fChain);
+
+    int B_before = 0;
+    int B_after = 0;
+    Int_t currentTreeNumber = -1;
+
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formulaData.UpdateFormulaLeaves();
+        }
+        fChain->GetEntry(jentry);
+
+        if(id != 0)
+            continue;
+        if(D_M >= blindMin && D_M <= blindMax)
+            continue; // Solo sidebands
+        if(D_M < xMin || D_M > xMax)
+            continue;
+
+        B_before++;
+        if(formulaData.EvalInstance() > 0)
+            B_after++;
+    }
+
+    // 2. STIMA DEL SEGNALE (S) DAL MONTE CARLO
+    LoadDataset(1);
+    TTreeFormula formulaMC("cutMC", cutString.Data(), fChain);
+
+    int S_before = 0;
+    int S_after = 0;
+    currentTreeNumber = -1;
+
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formulaMC.UpdateFormulaLeaves();
+        }
+        fChain->GetEntry(jentry);
+
+        if(id != 44)
+            continue; // Ds -> tau nu
+
+        S_before++;
+        if(formulaMC.EvalInstance() > 0)
+            S_after++;
+    }
+
+    // 3. CALCOLO DELLA FOM
+    double eff_sig = (S_before > 0) ? (double)S_after / S_before : 0.0;
+    double fom = 0.0;
+    if(B_after > 0)
+    {
+        fom = eff_sig / std::sqrt((double)B_after);
+    }
+
+    return fom;
+}
+
+// ================================================================================
+// ScanVariable: Calculates FOM, formats the TGraph and RETURNS it
+// ================================================================================
+TGraph *analysis::ScanVariable(const TString &baseline, const TString &varFormula, double start,
+    double stop, double step, double baseline_fom)
+{
+    std::cout << "\n--- Scanning: " << varFormula.Data() << " ---" << std::endl;
+
+    std::vector<double> x_vals;
+    std::vector<double> y_foms;
+
+    double best_fom = -1.0;
+    double best_val = 0.0;
+
+    int n_steps = std::abs((stop - start) / step) + 1;
+
+    for(int i = 0; i < n_steps; ++i)
+    {
+        double current_val = start + i * step;
+
+        TString test_cond = varFormula;
+        test_cond.ReplaceAll("X", Form("%g", current_val));
+
+        TString full_cut = baseline + " && " + test_cond;
+
+        double fom = EvaluateFOM(full_cut);
+
+        x_vals.push_back(current_val);
+        y_foms.push_back(fom);
+
+        if(fom > best_fom)
+        {
+            best_fom = fom;
+            best_val = current_val;
+        }
+    }
+
+    TString varName = varFormula;
+    int idx = varName.Index("X");
+    if(idx > 0)
+        varName.Remove(idx);
+    varName.ReplaceAll(">", "");
+    varName.ReplaceAll("<", "");
+    varName.ReplaceAll(" ", "");
+    varName.ReplaceAll("(", "");
+    varName.ReplaceAll(")", "");
+
+    std::cout << ">>> BEST CUT for " << varName.Data() << " is: " << best_val
+              << " (FOM = " << best_fom << ")" << std::endl;
+
+    // Costruiamo e formattiamo il TGraph (rimane in memoria Heap)
+    TGraph *g_fom = new TGraph(x_vals.size(), &x_vals[0], &y_foms[0]);
+    g_fom->SetName(Form("g_%s", varName.Data()));
+    g_fom->SetTitle(Form("%s;Cut Value;FOM", varName.Data()));
+    g_fom->SetMarkerStyle(20);
+    g_fom->SetMarkerSize(1.0);
+    g_fom->SetMarkerColor(kBlue + 1);
+    g_fom->SetLineColor(kBlue + 1);
+    g_fom->SetLineWidth(2);
+
+    // Se savePlots è attivo, salviamo comunque il PDF singolo in background
+    if(savePlots)
+    {
+        TCanvas *c_temp = new TCanvas("c_temp", "", 800, 600);
+        c_temp->cd();
+        c_temp->SetGrid();
+        g_fom->Draw("APL");
+
+        TLine *l_base = new TLine(start, baseline_fom, stop, baseline_fom);
+        l_base->SetLineStyle(2);
+        l_base->SetLineColor(kGray + 2);
+        l_base->Draw("SAME");
+
+        c_temp->SaveAs(Form("./_fig/FOM_Scan_%s.pdf", varName.Data()));
+        delete c_temp; // Elimina solo la finestra temporanea, non il TGraph!
+    }
+
+    return g_fom; // Restituisce il grafico pronto per il pannello finale
+}
+
+// ================================================================================
+// OptimizeCuts: Runs all scans and displays a 4x3 interactive Dashboard
+// ================================================================================
+void analysis::OptimizeCuts()
+{
+    std::cout << "\n=======================================================" << std::endl;
+    std::cout << "   STARTING AUTOMATED OFFLINE CUTS OPTIMIZATION" << std::endl;
+    std::cout << "=======================================================" << std::endl;
+
+    TString baseline = "(h1_pt > 0.450 && h2_pt > 0.450) && (h1_p > 3.0 && h2_p > 3.0) && "
+                       "(h1_eta > 2.0 && h1_eta < 4.2) && (h2_eta > 2.0 && h2_eta < 4.2) && "
+                       "(h1_IP > 60e-6 && h2_IP > 60e-6) && "
+                       "h3_pt > 0.350 && h3_p > 3.0 && (h3_eta > 2.0 && h3_eta < 4.2) && "
+                       "h3_IP > 90e-6 && h3_MuonID == 1 && "
+                       "M0_pt > 0.9 && D_pt > 2.5 && D_time > 0.25e-12 && "
+                       "(D_M > 1.6 && D_M < 2.1)";
+
+    double baseline_fom = EvaluateFOM(baseline);
+    std::cout << "\n=======================================================" << std::endl;
+    std::cout << " BASELINE FOM (Table 2 cuts only) = " << baseline_fom << std::endl;
+    std::cout << "=======================================================" << std::endl;
+
+    // Vettore per raccogliere tutti i TGraph generati
+    std::vector<TGraph *> graphs;
+
+    // Eseguiamo gli 11 scansamenti e raccogliamo i grafici
+    graphs.push_back(ScanVariable(baseline, "h3_pt > X", 0.350, 1.5, 0.1, baseline_fom));
+    graphs.push_back(ScanVariable(baseline, "h3_p > X", 3.0, 15.0, 1.0, baseline_fom));
+    graphs.push_back(ScanVariable(baseline, "h3_IP > X", 90e-6, 300e-6, 30e-6, baseline_fom));
+
+    graphs.push_back(
+        ScanVariable(baseline, "(h1_pt > X && h2_pt > X)", 0.450, 1.5, 0.1, baseline_fom));
+    graphs.push_back(
+        ScanVariable(baseline, "(h1_p > X && h2_p > X)", 3.0, 15.0, 1.0, baseline_fom));
+    graphs.push_back(
+        ScanVariable(baseline, "(h1_IP > X && h2_IP > X)", 60e-6, 200e-6, 20e-6, baseline_fom));
+
+    graphs.push_back(ScanVariable(baseline, "M0_pt > X", 0.9, 3.0, 0.3, baseline_fom));
+
+    graphs.push_back(
+        ScanVariable(baseline, "D_time > X", 0.25e-12, 1.5e-12, 0.15e-12, baseline_fom));
+    graphs.push_back(ScanVariable(baseline, "D_pt > X", 2.5, 6.0, 0.5, baseline_fom));
+
+    graphs.push_back(ScanVariable(baseline, "D_IP < X", 100e-6, 10e-6, -10e-6, baseline_fom));
+    graphs.push_back(ScanVariable(baseline, "D_FDt > X", 0.0, 0.01, 0.001, baseline_fom));
+
+    // ==========================================================
+    // CREAZIONE DEL DASHBOARD RIASSUNTIVO (GRIGLIA 4x3)
+    // ==========================================================
+    // NOTA: Non cancelliamo questo Canvas a fine funzione, così rimarrà aperto!
+    TCanvas *c_summary
+        = new TCanvas("c_summary", "Offline Cuts Optimization Dashboard", 1600, 1000);
+    c_summary->Divide(4, 3); // 4 colonne, 3 righe (ospita fino a 12 grafici)
+
+    for(size_t i = 0; i < graphs.size(); ++i)
+    {
+        c_summary->cd(i + 1);
+        gPad->SetGrid();
+        gPad->SetBottomMargin(0.15);
+        gPad->SetLeftMargin(0.15);
+
+        // Disegna il grafico
+        graphs[i]->Draw("APL");
+
+        // Disegna la linea della FOM di riferimento (tratteggiata grigia)
+        double start = graphs[i]->GetX()[0];
+        double stop = graphs[i]->GetX()[graphs[i]->GetN() - 1];
+        TLine *l_base = new TLine(start, baseline_fom, stop, baseline_fom);
+        l_base->SetLineStyle(2);
+        l_base->SetLineColor(kGray + 2);
+        // l_base->SetLineWidth(2);
+        l_base->Draw("SAME");
+    }
+
+    c_summary->Update();
+
+    std::cout << "\n=======================================================" << std::endl;
+    std::cout << "   DASHBOARD GENERATED SUCCESSFULLY!" << std::endl;
+    std::cout << "   Look at the 'c_summary' window on your screen." << std::endl;
+    std::cout << "   The dashed line represents the baseline selection FOM." << std::endl;
+    std::cout << "=======================================================" << std::endl;
+}
+
+// ================================================================================
+// OptimizeAllParentCuts: Performs a scan on ALL 8 physical variables of parent D
+// ================================================================================
+void analysis::OptimizeAllParentCuts()
+{
+    std::cout << "\n=======================================================" << std::endl;
+    std::cout << "   RUNNING EXHAUSTIVE PARENT D VARIABLES OPTIMIZATION" << std::endl;
+    std::cout << "=======================================================" << std::endl;
+
+    // Baseline dei figli (Kaoni, Muone e Phi bloccati ai tagli minimi)
+    TString baseline_daughters
+        = "(h1_pt > 0.450 && h2_pt > 0.450) && (h1_p > 3.0 && h2_p > 3.0) && "
+          "(h1_eta > 2.0 && h1_eta < 4.2) && (h2_eta > 2.0 && h2_eta < 4.2) && "
+          "(h1_IP > 60e-6 && h2_IP > 60e-6) && "
+          "h3_pt > 0.350 && h3_p > 3.0 && (h3_eta > 2.0 && h3_eta < 4.2) && "
+          "h3_IP > 90e-6 && h3_MuonID == 1 && "
+          "M0_pt > 0.9 && (D_M > 1.6 && D_M < 2.1)";
+
+    // Valutiamo la Punzi FOM al livello di trigger minimo (D_pt > 2.5, D_time > 0.25ps)
+    TString trigger_tau = baseline_daughters + " && D_pt > 2.5 && D_time > 0.25e-12";
+    double baseline_fom = EvaluateFOM(trigger_tau);
+
+    std::cout << "  Initial Trigger-Level FOM (No extra parent cuts) = " << baseline_fom
+              << std::endl;
+    std::cout << "-------------------------------------------------------" << std::endl;
+
+    std::vector<TGraph *> graphs;
+
+    // -- 1. D_pt (Momento trasverso parent) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_pt > X", 2.5, 6.0, 0.5, baseline_fom));
+
+    // -- 2. D_p (Momento totale parent) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_p > X", 10.0, 50.0, 5.0, baseline_fom));
+
+    // -- 3. D_eta (Pseudorapidità parent) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_eta > X", 2.0, 3.2, 0.2, baseline_fom));
+
+    // -- 4. D_time (Tempo di decadimento proprio ct) --
+    graphs.push_back(
+        ScanVariable(trigger_tau, "D_time > X", 0.25e-12, 1.5e-12, 0.15e-12, baseline_fom));
+
+    // -- 5. D_IP (Impact Parameter parent - si scansiona al ribasso < X) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_IP < X", 100e-6, 10e-6, -10e-6, baseline_fom));
+
+    // -- 6. D_FD (Distanza di volo 3D totale - in metri, da 0 a 10 mm) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_FD > X", 0.0, 10e-3, 1e-3, baseline_fom));
+
+    // -- 7. D_FDt (Distanza di volo trasversale xy - in metri, da 0 a 5 mm) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_FDt > X", 0.0, 5e-3, 0.5e-3, baseline_fom));
+
+    // -- 8. D_FDz (Distanza di volo longitudinale z - in metri, da 0 a 15 mm) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_FDz > X", 0.0, 15e-3, 1.5e-3, baseline_fom));
+
+    // ==========================================================
+    // DISEGNO DEL DASHBOARD RIASSUNTIVO (GRIGLIA 4x2)
+    // ==========================================================
+    TCanvas *c_parent
+        = new TCanvas("c_parent", "Parent D Variables Optimization (All 8 Variables)", 1600, 800);
+    c_parent->Divide(4, 2); // 4 colonne, 2 righe
+
+    TString titles[8] = { "p_{T}(D) Cut [GeV/#it{c}]", "p(D) Cut [GeV/#it{c}]", "#eta(D) Cut",
+        "#it{ct}(D) Cut [seconds]", "IP(D) Cut [meters]", "FD(D) Cut [meters]",
+        "FD_{T}(D) Cut [meters]", "FD_{z}(D) Cut [meters]" };
+
+    for(size_t i = 0; i < graphs.size(); ++i)
+    {
+        c_parent->cd(i + 1);
+        gPad->SetGrid();
+        gPad->SetBottomMargin(0.15);
+        gPad->SetLeftMargin(0.15);
+
+        // Formattazione etichette assi per renderle fisicamente chiare
+        graphs[i]->GetXaxis()->SetTitle(titles[i].Data());
+        graphs[i]->GetYaxis()->SetTitle("Punzi FOM");
+        graphs[i]->Draw("APL");
+
+        // Disegna la linea di riferimento della FOM iniziale (Trigger level)
+        double start = graphs[i]->GetX()[0];
+        double stop = graphs[i]->GetX()[graphs[i]->GetN() - 1];
+        TLine *l_base = new TLine(start, baseline_fom, stop, baseline_fom);
+        l_base->SetLineStyle(2);
+        l_base->SetLineColor(kGray + 2);
+        l_base->SetLineWidth(2);
+        l_base->Draw("SAME");
+    }
+
+    c_parent->Update();
+
+    std::cout << "\n=======================================================" << std::endl;
+    std::cout << "   PARENT VARIABLES OPTIMIZATION COMPLETED!" << std::endl;
+    std::cout << "   Visualise the 4x2 dashboard 'c_parent' on your screen." << std::endl;
+    std::cout << "   All 8 physical variables of the tau candidate have been evaluated."
+              << std::endl;
+    std::cout << "=======================================================\n" << std::endl;
+}
+
+void analysis::StudyVertexCorrelations()
+{
+    SetLBStyle(); // Applica il tuo stile di pubblicazione (font 43, 26px, no titoli)
+    gStyle->SetOptStat(0);
+    gStyle->SetPaintTextFormat("+.2f"); // Forza la scrittura dei numeri con segno e 2 decimali
+
+    const int nVars = 5;
+    double blindMin = 1.777 - 3 * 0.0058;
+    double blindMax = 1.777 + 3 * 0.0058;
+
+    std::vector<std::vector<double>> data_Signal(nVars);
+    std::vector<std::vector<double>> data_Bkg(nVars);
+
+    // =========================================================================
+    // 1. LETTURA MC SEGNALE (ID 44)
+    // =========================================================================
+    LoadDataset(1);
+    if(!fChain)
+    {
+        cerr << "[ERROR] fChain nullo per il MC!" << endl;
+        return;
+    }
+
+    cout << "--> Lettura in corso: MC Segnale (ID 44)..." << endl;
+    Long64_t nEntriesMC = fChain->GetEntries();
+    for(Long64_t jentry = 0; jentry < nEntriesMC; jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        fChain->GetEntry(jentry);
+        if(id != 44)
+            continue;
+
+        // Lettura diretta super-veloce e crash-proof delle variabili membro
+        data_Signal[0].push_back(D_IP);
+        data_Signal[1].push_back(D_FD);
+        data_Signal[2].push_back(D_FDt);
+        data_Signal[3].push_back(D_FDz);
+        data_Signal[4].push_back(D_time);
+    }
+
+    // =========================================================================
+    // 2. LETTURA DATI REALI (FONDO)
+    // =========================================================================
+    LoadDataset(0);
+    if(!fChain)
+    {
+        cerr << "[ERROR] fChain nullo per i Dati Reali!" << endl;
+        return;
+    }
+
+    cout << "--> Lettura in corso: Dati Reali Blindati (ID 0)..." << endl;
+    Long64_t nEntriesData = fChain->GetEntries();
+    for(Long64_t jentry = 0; jentry < nEntriesData; jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        fChain->GetEntry(jentry);
+        if(id != 0)
+            continue;
+        if(D_M >= blindMin && D_M <= blindMax)
+            continue; // Blinding
+
+        data_Bkg[0].push_back(D_IP);
+        data_Bkg[1].push_back(D_FD);
+        data_Bkg[2].push_back(D_FDt);
+        data_Bkg[3].push_back(D_FDz);
+        data_Bkg[4].push_back(D_time);
+    }
+
+    // =========================================================================
+    // 3. CALCOLO E DISEGNO DELLE MATRICI
+    // =========================================================================
+    TH2D *hCorrSignal = new TH2D("hCorrSignal", "", nVars, 0, nVars, nVars, 0, nVars);
+    TH2D *hCorrBkg = new TH2D("hCorrBkg", "", nVars, 0, nVars, nVars, 0, nVars);
+
+    std::vector<TString> axisLabels
+        = { "IP(D)", "FD(D)", "FD_{T}(D)", "FD_{z}(D)", "#tau(D) [ct]" };
+    for(int i = 0; i < nVars; ++i)
+    {
+        hCorrSignal->GetXaxis()->SetBinLabel(i + 1, axisLabels[i]);
+        hCorrSignal->GetYaxis()->SetBinLabel(i + 1, axisLabels[i]);
+        hCorrBkg->GetXaxis()->SetBinLabel(i + 1, axisLabels[i]);
+        hCorrBkg->GetYaxis()->SetBinLabel(i + 1, axisLabels[i]);
+    }
+
+    // Algoritmo di Pearson corretto (Scale-Invariant e immune a variabili con ordini di grandezza
+    // minuscoli)
+    auto GetPearsonCorrelation
+        = [](const std::vector<double> &x, const std::vector<double> &y) -> double
+    {
+        if(x.empty() || x.size() != y.size())
+            return 0.0;
+        double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
+        size_t n = x.size();
+        for(size_t i = 0; i < n; ++i)
+        {
+            sumX += x[i];
+            sumY += y[i];
+            sumXY += x[i] * y[i];
+            sumX2 += x[i] * x[i];
+            sumY2 += y[i] * y[i];
+        }
+
+        double varX = (double)n * sumX2 - sumX * sumX;
+        double varY = (double)n * sumY2 - sumY * sumY;
+
+        if(varX <= 0.0 || varY <= 0.0)
+            return 0.0;
+
+        double num = (double)n * sumXY - sumX * sumY;
+        double den = std::sqrt(varX * varY);
+        return num / den;
+    };
+
+    for(int i = 0; i < nVars; ++i)
+    {
+        for(int j = 0; j < nVars; ++j)
+        {
+            hCorrSignal->SetBinContent(
+                i + 1, j + 1, GetPearsonCorrelation(data_Signal[i], data_Signal[j]));
+            hCorrBkg->SetBinContent(i + 1, j + 1, GetPearsonCorrelation(data_Bkg[i], data_Bkg[j]));
+        }
+    }
+
+    TCanvas *cCorr = new TCanvas("cCorr", "Correlations", 1500, 700);
+    cCorr->Divide(2, 1);
+
+    hCorrSignal->GetZaxis()->SetRangeUser(-1.0, 1.0);
+    hCorrSignal->SetMarkerSize(1.5);
+    hCorrSignal->SetMarkerColor(kBlack);
+
+    hCorrBkg->GetZaxis()->SetRangeUser(-1.0, 1.0);
+    hCorrBkg->SetMarkerSize(1.5);
+    hCorrBkg->SetMarkerColor(kBlack);
+
+    // Trucco temporaneo del font di testo a precisione-2 per disegnare correttamente i numeri
+    gStyle->SetTextFont(42);
+
+    cCorr->cd(1);
+    gPad->SetLeftMargin(0.22);
+    gPad->SetBottomMargin(0.18);
+    gPad->SetRightMargin(0.15);
+    hCorrSignal->Draw("COLZ TEXT");
+
+    cCorr->cd(2);
+    gPad->SetLeftMargin(0.22);
+    gPad->SetBottomMargin(0.18);
+    gPad->SetRightMargin(0.15);
+    hCorrBkg->Draw("COLZ TEXT");
+
+    cCorr->Update();
+
+    if(savePlots)
+    {
+        cCorr->SaveAs("./_fig/ParentVertex_Correlations.pdf");
+        cCorr->SaveAs("./_root/ParentVertex_Correlations.root");
+    }
+
+    // Ripristino del font in pixel originale
+    gStyle->SetTextFont(43);
+
+    cout << "--> Analisi delle correlazioni completata con successo!" << endl;
 }
