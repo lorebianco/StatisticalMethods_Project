@@ -245,27 +245,34 @@ class analysis
     virtual void Show(Long64_t entry = -1);
 
     // User functions
+    TString GetCutString(bool useOptimized);
+    double GetMCEfficiencyRatio(bool useOptimized);
     AuxFitResult FitTemplateMass(Int_t mcID);
-    AuxFitResult FitCombinatorialBkg(bool usePol1 = false);
-    void DoFullBlindedUnbinnedFit();
+    void DoFullBlindedFit();
     ToyMetrics RunToyMC(int nToys, double true_fs);
     void RunFeldmanCousinsPipeline(int nToysPerPoint);
-    void ConstructBelt(double sigma0, double alpha, double max_x_val, int mode);
+    void ConstructBelt(double sigma0, double alpha, double max_val, int mode,
+        const std::vector<double> &discrete_mu, const std::vector<double> &discrete_sigma);
+    void InterpolateDiscreteBelt(
+        const TString &nameSuffix, double smoothingSpan = 0.30, bool overlayContinuous = false);
     void VerifyWilksTheorem(int nToys);
 
     // Cut optimization
     void CheckCut(const TString &cutString);
-    double EvaluateFOM(const TString &cutString);
+    double EvaluateFOM(const TString &cutString, double a_param);
     TGraph *ScanVariable(const TString &baseline, const TString &varFormula, double start,
-        double stop, double step, double baseline_fom);
-    void OptimizeCuts();
-    void OptimizeAllParentCuts();
+        double stop, double step, double baseline_fom, double a_param);
+    void OptimizeParentCuts(double a_param = 3.0);
     void StudyVertexCorrelations();
 
     // Helpers for blind analysis
     inline TH1D *GetBlindedClone(TH1D *h, Double_t blindMin, Double_t blindMax);
     inline void DrawBlindedFunction(
         TF1 *f, Double_t blindMin, Double_t blindMax, Option_t *option = "SAME");
+    void DrawBlindedBkgFit(const TString &cutString, double a_param = 3.0);
+
+    // UNBLINDING
+    void UnblindResults();
 
     // Nuovi membri per memorizzare i risultati del fit reale
     std::vector<double> m_fitted_pars;

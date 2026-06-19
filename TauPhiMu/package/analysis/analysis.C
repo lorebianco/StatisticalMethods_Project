@@ -21,13 +21,16 @@
 #include <TFitResult.h>
 #include <TFitResultPtr.h>
 #include <TGraphErrors.h>
+#include <TGraphSmooth.h>
 #include <TH2.h>
 #include <TLegend.h>
 #include <TLine.h>
+#include <TMarker.h>
 #include <TMath.h>
 #include <TMatrixDSym.h>
 #include <TPaveStats.h>
 #include <TRandom3.h>
+#include <TSpline.h>
 #include <TStyle.h>
 #include <TTreeFormula.h>
 
@@ -39,7 +42,10 @@ using namespace ROOT::Math;
 using namespace TMath;
 using namespace lbStyle;
 
-constexpr Bool_t savePlots = false;
+constexpr Bool_t savePlots = true;
+constexpr Bool_t USE_OPTIMIZED_CUTS = true;
+constexpr Bool_t USE_UNBINNED = false;
+constexpr Bool_t USE_EXTENDED = true;
 constexpr UInt_t THE_SEED = 0;
 
 // pdf = f_s p(s) + (1-f_s) * (f_1 * p_1 + f_2 * p_2 + f_3 * p_3 + (1 - f_1 - f_2 - f_3) * p_4)
@@ -59,6 +65,22 @@ inline Double_t f_2G_Frac(Double_t *x, Double_t *par)
     double g2 = TMath::Exp(-0.5 * dx2 * dx2) / (par[3] * TMath::Sqrt(TMath::TwoPi()));
 
     return par[0] * (par[4] * g1 + (1.0 - par[4]) * g2);
+}
+
+inline Double_t Pol2Blinded(Double_t *x, Double_t *par)
+{
+    // Definizione dei limiti di blinding (3 sigma attorno alla massa del tau)
+    const double blindMin = 1.777 - 3 * 0.0058; // 1.7596 GeV
+    const double blindMax = 1.777 + 3 * 0.0058; // 1.7944 GeV
+
+    if(x[0] > blindMin && x[0] < blindMax)
+    {
+        TF1::RejectPoint(); // Esclude la blinding region dal fit
+        return 0.0;
+    }
+
+    double m_shift = x[0] - 1.85; // Shift spaziale per stabilità numerica del fit
+    return par[0] + par[1] * m_shift + par[2] * m_shift * m_shift;
 }
 
 class ArgusPDF
@@ -300,6 +322,7 @@ class FullUnbinnedPDF
 // --- NLL for unbinned fit ---
 thread_local std::vector<double> g_data_events;
 thread_local FullUnbinnedPDF *g_pdf_unbinned = nullptr;
+thread_local TH1D *g_data_hist = nullptr;
 
 inline double Unbinned2NLL(const double *par)
 {
@@ -314,51 +337,88 @@ inline double Unbinned2NLL(const double *par)
     return 2.0 * nll;
 }
 
-/*
-    // --- Likelihood ratio ordering
-    inline Double_t LROrdering(Double_t *x, Double_t *par)
+inline double Binned2NLL(const double *par)
+{
+    double nll = 0.0;
+    int nBins = g_data_hist->GetNbinsX();
+
+    for(int i = 1; i <= nBins; i++)
     {
-    double xx = x[0];
-    double mu = par[0];
-    double sigma = par[1];
+        double n_obs = g_data_hist->GetBinContent(i);
 
-    if(xx >= 0)
-        return exp(-0.5 * (xx - mu) * (xx - mu) / (sigma * sigma));
-    else
-        return exp(
-            (-0.5 * (xx - mu) * (xx - mu) / (sigma * sigma)) + 0.5 * (xx * xx) / (sigma * sigma));
+        if(n_obs > 0)
+        {
+            // Ottieni i bordi e il centro del bin
+            double x_low = g_data_hist->GetXaxis()->GetBinLowEdge(i);
+            double x_up = g_data_hist->GetXaxis()->GetBinUpEdge(i);
+            double x_mid = g_data_hist->GetBinCenter(i);
+
+            // Valuta la PDF in 3 punti
+            double f_low = (*g_pdf_unbinned)(&x_low, par);
+            double f_mid = (*g_pdf_unbinned)(&x_mid, par);
+            double f_up = (*g_pdf_unbinned)(&x_up, par);
+
+            // Regola di Simpson per l'integrale del bin: (dx / 6) * (f(a) + 4f(m) + f(b))
+            double bin_width = x_up - x_low;
+            double p_i = (bin_width / 6.0) * (f_low + 4.0 * f_mid + f_up);
+
+            nll -= n_obs * std::log(p_i);
+        }
+    }
+    return 2.0 * nll;
 }
-*/
 
-// --- Likelihood ratio ordering (Feldman-Cousins con sigma dinamica)
+inline double BinnedExtended2NLL(const double *par)
+{
+    double nll = 0.0;
+    int nBins = g_data_hist->GetNbinsX();
+
+    // Il parametro 20 è il numero totale atteso di eventi (N_tot)
+    double N_tot = par[20];
+
+    for(int i = 1; i <= nBins; i++)
+    {
+        double n_obs = g_data_hist->GetBinContent(i);
+
+        // Integrazione del bin con la regola di Simpson
+        double x_low = g_data_hist->GetXaxis()->GetBinLowEdge(i);
+        double x_up = g_data_hist->GetXaxis()->GetBinUpEdge(i);
+        double x_mid = g_data_hist->GetBinCenter(i);
+
+        double f_low = (*g_pdf_unbinned)(&x_low, par);
+        double f_mid = (*g_pdf_unbinned)(&x_mid, par);
+        double f_up = (*g_pdf_unbinned)(&x_up, par);
+
+        double bin_width = x_up - x_low;
+        double p_i = (bin_width / 6.0) * (f_low + 4.0 * f_mid + f_up); // Probabilità nel bin
+
+        double mu_i = N_tot * p_i; // Eventi attesi in questo bin
+
+        if(n_obs > 0)
+            nll += (mu_i - n_obs * std::log(mu_i));
+        else
+            nll += mu_i; // Se il bin è vuoto, rimane solo il termine lineare mu_i
+    }
+    return 2.0 * nll;
+}
+
+// --- Likelihood ratio ordering (Feldman-Cousins con sigma costante per fetta mu)
 inline Double_t LROrdering(Double_t *x, Double_t *par)
 {
     double xx = x[0];
     double mu = par[0];
-    double sigma0 = par[1];
-    double alpha = par[2];
-
-    // Calcolo la sigma per l'ipotesi mu (numeratore)
-    double sigma_mu = sigma0 + alpha * mu;
-
-    // Calcolo il best-fit e la sua rispettiva sigma (denominatore)
-    double mu_best = std::max(0.0, xx); // Limite fisico: mu_best >= 0
-    double sigma_best = sigma0 + alpha * mu_best;
-
-    // Prefattore matematico derivante dal rapporto 1/sigma_mu diviso 1/sigma_best
-    double prefactor = sigma_best / sigma_mu;
+    double sigma = par[1]; // Sigma costante per questa specifica fetta della banda
 
     if(xx >= 0)
     {
-        // Se xx >= 0, allora mu_best = xx. Il termine esponenziale al denominatore è exp(0) = 1.
-        return prefactor * exp(-0.5 * (xx - mu) * (xx - mu) / (sigma_mu * sigma_mu));
+        // Caso x >= 0: mu_best = x (il denominatore della verosimiglianza è pari a 1)
+        return exp(-0.5 * (xx - mu) * (xx - mu) / (sigma * sigma));
     }
     else
     {
-        // Se xx < 0, allora mu_best = 0. Il denominatore ha un esponenziale valutato in 0.
-        return prefactor
-            * exp((-0.5 * (xx - mu) * (xx - mu) / (sigma_mu * sigma_mu))
-                + (0.5 * (xx * xx) / (sigma_best * sigma_best)));
+        // Caso x < 0: mu_best = 0 (il denominatore è valutato in 0)
+        return exp(
+            (-0.5 * (xx - mu) * (xx - mu) / (sigma * sigma)) + (0.5 * (xx * xx) / (sigma * sigma)));
     }
 }
 
@@ -466,6 +526,53 @@ void analysis::Loop()
     histo_file->Close();
 }
 
+double analysis::GetMCEfficiencyRatio(bool useOptimized)
+{
+    // Numero di eventi generati alla sorgente (Tabella 1)
+    const double n_gen_sig = 1.0e6; // ID 44 (Signal Ds -> tau nu)
+    const double n_gen_norm = 5.0e6; // ID 42 (Norm Ds -> phi mu nu)
+
+    LoadDataset(1); // Carichiamo il file MC
+    if(!fChain)
+        return 0.0;
+
+    TString cutString = GetCutString(useOptimized);
+    TTreeFormula formula("cut", cutString.Data(), fChain);
+    Int_t currentTreeNumber = -1;
+
+    long long n_pass_sig = 0;
+    long long n_pass_norm = 0;
+
+    Long64_t nentries = fChain->GetEntries();
+    for(Long64_t jentry = 0; jentry < nentries; jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formula.UpdateFormulaLeaves();
+        }
+        fChain->GetEntry(jentry);
+
+        // Conta gli eventi sopravvissuti ai tagli attivi
+        if(formula.EvalInstance() > 0)
+        {
+            if(id == 44)
+                n_pass_sig++;
+            if(id == 42)
+                n_pass_norm++;
+        }
+    }
+
+    double eff_sig = (double)n_pass_sig / n_gen_sig;
+    double eff_norm = (double)n_pass_norm / n_gen_norm;
+
+    if(eff_sig <= 0.0)
+        return 0.0;
+    return eff_norm / eff_sig; // Ritorna il rapporto r_eff dinamico
+}
+
 AuxFitResult analysis::FitTemplateMass(Int_t mcID)
 {
     AuxFitResult res;
@@ -482,36 +589,39 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
         return res;
     }
 
-    Long64_t nentries = fChain->GetEntries();
-    if(nentries <= 0)
-    {
-        cout << "[WARNING] No entries found in fChain!" << endl;
-        return res;
-    }
-
-    // 1. ALLOCHIAMO SUBITO IL CANVAS CORRETTO (Evita i crash grafici interni di ROOT durante
-    // GetEntry)
     SetLBStyle();
-
-    // --- MODIFICA 1: Sovrascriviamo le impostazioni dello stile globale per abilitare la Box ---
-    gStyle->SetOptFit(1111); // Forza la comparsa di: Chi2/ndf, Parametri, Errori, Status
+    gStyle->SetOptFit(1111);
 
     TCanvas *cMass = new TCanvas(Form("cMass_%d", mcID), Form("Mass Fit MC %d", mcID), 800, 600);
     cMass->cd();
 
     std::vector<Double_t> mass_vals;
-    mass_vals.reserve(static_cast<size_t>(nentries));
 
+    // Setup della formula di taglio attiva
+    TString cutString = GetCutString(USE_OPTIMIZED_CUTS);
+    TTreeFormula formula("cut", cutString.Data(), fChain);
+    Int_t currentTreeNumber = -1;
+
+    Long64_t nentries = fChain->GetEntries();
     for(Long64_t jentry = 0; jentry < nentries; jentry++)
     {
-        Long64_t ientry = LoadTree(jentry);
-        if(ientry < 0)
+        if(LoadTree(jentry) < 0)
             break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formula.UpdateFormulaLeaves();
+        }
         fChain->GetEntry(jentry);
 
         if(id != mcID)
             continue;
-        mass_vals.push_back(D_M);
+
+        // Applica il filtro se attivo
+        if(formula.EvalInstance() > 0)
+        {
+            mass_vals.push_back(D_M);
+        }
     }
 
     if(mass_vals.empty())
@@ -520,7 +630,8 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
         return res;
     }
 
-    // ... [Il codice intermedio di calcolo di meanInit, rmsInit, xMin, xMax rimane identico] ...
+    // ... [Il codice intermedio di calcolo di meanInit, rmsInit, xMin, xMax rimane identico]
+    // ...
     Double_t sum = 0.0;
     for(double m : mass_vals)
         sum += m;
@@ -659,7 +770,8 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
         // 2. Fai il Fit
         r = h_mass->Fit(fFitMass, "L I R S Q");
 
-        // 3. AGGIORNA IL CANVAS (Questo passaggio mancava e generava un puntatore nullo su 'stats')
+        // 3. AGGIORNA IL CANVAS (Questo passaggio mancava e generava un puntatore nullo su
+        // 'stats')
         cMass->Modified();
         cMass->Update();
 
@@ -719,137 +831,7 @@ AuxFitResult analysis::FitTemplateMass(Int_t mcID)
     return res;
 }
 
-AuxFitResult analysis::FitCombinatorialBkg(bool usePol1)
-{
-    AuxFitResult res;
-    SetLBStyle();
-    gStyle->SetOptFit(1111);
-
-    LoadDataset(0);
-
-    Double_t xMin = 2.0;
-    Double_t xMax = 2.09;
-
-    auto h_mass
-        = new TH1D("h_mass_bkg", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
-    h_mass->SetDirectory(nullptr);
-    AddBinSizeOnYTitle(h_mass, "GeV/#it{c}^{2}");
-
-    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
-    {
-        if(LoadTree(jentry) < 0)
-            break;
-        fChain->GetEntry(jentry);
-
-        if(id != 0)
-        {
-            cerr << "[ERROR] Loaded data is MC, not real data!" << endl;
-            return res;
-        }
-        h_mass->Fill(D_M);
-    }
-
-    Double_t binWidth = h_mass->GetBinWidth(1);
-
-    TF1 *f_bkg = nullptr;
-    Double_t yieldInit = h_mass->GetEntries();
-
-    if(usePol1)
-    {
-        Pol1PDF pol1_func(xMin, xMax, binWidth);
-        f_bkg = new TF1("f_bkg", pol1_func, xMin, xMax, 2);
-        f_bkg->SetParameters(yieldInit, 0.0);
-        f_bkg->SetParNames("Yield", "Slope");
-        cout << "\n--- Fitting Combinatorial Background with Pol1PDF Functor ---" << endl;
-    }
-    else
-    {
-        ExpoPDF expo_func(xMin, xMax, binWidth);
-        f_bkg = new TF1("f_bkg", expo_func, xMin, xMax, 2);
-        f_bkg->SetParameters(yieldInit, -2.0);
-        f_bkg->SetParNames("Yield", "Lambda");
-        cout << "\n--- Fitting Combinatorial Background with ExpoPDF Functor ---" << endl;
-    }
-
-    TFitResultPtr r = h_mass->Fit(f_bkg, "L I R S Q");
-
-    Double_t blindMin = 1.777 - 3 * 0.0058;
-    Double_t blindMax = 1.777 + 3 * 0.0058;
-
-    TCanvas *c_bkg = new TCanvas("c_bkg", "Combinatorial Background Fit", 800, 600);
-    c_bkg->cd();
-
-    TH1D *h_to_draw = h_mass;
-    bool isBlinded = (blindMin > xMin && blindMax < xMax);
-
-    if(isBlinded)
-    {
-        h_to_draw = analysis::GetBlindedClone(h_mass, blindMin, blindMax);
-    }
-
-    h_to_draw->SetStats(kTRUE);
-    h_to_draw->SetMinimum(0.0);
-    h_to_draw->SetMaximum(80.0);
-    h_to_draw->Draw("E");
-
-    c_bkg->Modified();
-    c_bkg->Update();
-
-    TPaveStats *st = (TPaveStats *)h_to_draw->FindObject("stats");
-    if(st)
-    {
-        st->SetOptFit(1111);
-        st->SetX1NDC(0.653);
-        st->SetY1NDC(0.734);
-        st->SetX2NDC(0.961);
-        st->SetY2NDC(0.972);
-    }
-
-    f_bkg->SetLineColor(kRed);
-    f_bkg->SetLineWidth(3);
-    if(isBlinded)
-    {
-        analysis::DrawBlindedFunction(f_bkg, blindMin, blindMax, "SAME");
-    }
-    else
-    {
-        f_bkg->Draw("SAME");
-    }
-
-    c_bkg->Modified();
-    c_bkg->Update();
-
-    if(savePlots)
-    {
-        c_bkg->SaveAs("./_fig/FitCombinatorialBkg.pdf");
-        c_bkg->SaveAs("./_root/FitCombinatorialBkg.root");
-    }
-
-    if(r.Get())
-    {
-        res.isValid = r->IsValid();
-        Int_t nPar = r->NPar();
-        res.params.resize(nPar);
-        res.errors.resize(nPar);
-        for(Int_t i = 0; i < nPar; ++i)
-        {
-            res.params[i] = r->Parameter(i);
-            res.errors[i] = r->ParError(i);
-        }
-        res.covMatrix.resize(nPar, std::vector<Double_t>(nPar, 0.0));
-        TMatrixDSym cov = r->GetCovarianceMatrix();
-        for(Int_t i = 0; i < nPar; ++i)
-        {
-            for(Int_t j = 0; j < nPar; ++j)
-            {
-                res.covMatrix[i][j] = cov(i, j);
-            }
-        }
-    }
-    return res;
-}
-
-void analysis::DoFullBlindedUnbinnedFit()
+void analysis::DoFullBlindedFit()
 {
     SetLBStyle();
 
@@ -888,25 +870,41 @@ void analysis::DoFullBlindedUnbinnedFit()
     g_data_events.reserve(static_cast<size_t>(nentries));
 
     auto h_mass
-        = new TH1D("h_mass_unbinned", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
+        = new TH1D("h_mass_unbinned", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 200, xMin, xMax);
     h_mass->SetDirectory(nullptr);
+
+    // Inizializza la formula basata sul constexpr globale
+    TString cutString = GetCutString(USE_OPTIMIZED_CUTS);
+    TTreeFormula formula("cut", cutString.Data(), fChain);
+    Int_t currentTreeNumber = -1;
 
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
         if(LoadTree(jentry) < 0)
             break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formula.UpdateFormulaLeaves();
+        }
         fChain->GetEntry(jentry);
         if(id != 0)
             continue;
 
-        if(D_M >= xMin && D_M <= xMax)
+        // Filtra i dati reali applicando l'interruttore
+        if(formula.EvalInstance() > 0)
         {
-            g_data_events.push_back(D_M);
-            h_mass->Fill(D_M);
+            if(D_M >= xMin && D_M <= xMax)
+            {
+                g_data_events.push_back(D_M);
+                h_mass->Fill(D_M);
+            }
         }
     }
     cout << "NEntries = " << h_mass->GetEntries() << endl;
     cout << endl;
+
+    g_data_hist = h_mass;
 
     Double_t binWidth = h_mass->GetBinWidth(1);
     Double_t nEntries = h_mass->GetEntries();
@@ -919,7 +917,11 @@ void analysis::DoFullBlindedUnbinnedFit()
     minimizer->SetTolerance(0.01);
     minimizer->SetPrintLevel(0);
 
-    ROOT::Math::Functor fNLL(&Unbinned2NLL, 20); // Impostato a 20 parametri
+    // Sceglie dinamicamente la NLL in base al flag constexpr
+    // // Imposta la dimensione del functor a 21 se extended, altrimenti 20
+    int nPars = USE_EXTENDED ? 21 : 20;
+    ROOT::Math::Functor fNLL(
+        USE_EXTENDED ? &BinnedExtended2NLL : (USE_UNBINNED ? &Unbinned2NLL : &Binned2NLL), nPars);
     minimizer->SetFunction(fNLL);
 
     // Parametri primari (Frazioni e pendenza)
@@ -984,6 +986,13 @@ void analysis::DoFullBlindedUnbinnedFit()
         minimizer->FixVariable(17);
         minimizer->FixVariable(18);
         minimizer->FixVariable(19);
+    }
+
+    // Se extended, aggiungiamo N_tot come parametro libero
+    if(USE_EXTENDED)
+    {
+        double nEntries = h_mass->GetEntries();
+        minimizer->SetVariable(20, "N_tot", nEntries, std::sqrt(nEntries));
     }
 
     cout << "\n--- Minimizing Unbinned Likelihood with MINUIT (Silenced) ---" << endl;
@@ -1082,59 +1091,64 @@ void analysis::DoFullBlindedUnbinnedFit()
 
     FullUnbinnedPDF *pdf_for_draw = g_pdf_unbinned;
 
-    // Aggiorniamo le lambda expression affinché usino le variabili post-fit locali 'best_...'
-    auto scale_pdf_lambda = [pdf_for_draw, nEntries, binWidth, xs](double *x, double *par)
+    // Calcolo del fattore di scala corretto (se il fit è esteso usa N_tot fittato, altrimenti le
+    // entrate dell'istogramma)
+    double nTotFit = USE_EXTENDED ? xs[20] : nEntries;
+
+    // Aggiorniamo le lambda expression affinché usino nTotFit e le variabili post-fit locali
+    // 'best_...'
+    auto scale_pdf_lambda = [pdf_for_draw, nTotFit, binWidth, xs](double *x, double *par)
     {
         double xx = x[0];
-        return nEntries * binWidth * (*pdf_for_draw)(&xx, xs);
+        return nTotFit * binWidth * (*pdf_for_draw)(&xx, xs);
     };
 
     auto scale_sig_lambda
-        = [pdf_for_draw, nEntries, binWidth, best_f_s, best_sig_mean, best_sig_sigma1,
+        = [pdf_for_draw, nTotFit, binWidth, best_f_s, best_sig_mean, best_sig_sigma1,
               best_sig_sigma2, best_sig_frac1](double *x, double *par)
     {
         double xx = x[0];
         double p_sig = pdf_for_draw->Eval2G(
             xx, best_sig_mean, best_sig_sigma1, best_sig_sigma2, best_sig_frac1);
-        return nEntries * binWidth * (best_f_s * p_sig);
+        return nTotFit * binWidth * (best_f_s * p_sig);
     };
 
-    auto scale_comb_lambda = [pdf_for_draw, nEntries, binWidth, best_f_s, best_f_1, best_f_2,
+    auto scale_comb_lambda = [pdf_for_draw, nTotFit, binWidth, best_f_s, best_f_1, best_f_2,
                                  best_f_3, best_slope, usePol1Bkg](double *x, double *par)
     {
         double xx = x[0];
         double p_4 = usePol1Bkg ? pdf_for_draw->EvalPol1(xx, best_slope)
                                 : pdf_for_draw->EvalExpo(xx, best_slope);
         double frac_comb = (1.0 - best_f_s) * (1.0 - best_f_1 - best_f_2 - best_f_3);
-        return nEntries * binWidth * (frac_comb * p_4);
+        return nTotFit * binWidth * (frac_comb * p_4);
     };
 
     auto scale_p1_lambda
-        = [pdf_for_draw, nEntries, binWidth, best_f_s, best_f_1, best_p1_mean, best_p1_sigma1,
+        = [pdf_for_draw, nTotFit, binWidth, best_f_s, best_f_1, best_p1_mean, best_p1_sigma1,
               best_p1_sigma2, best_p1_frac1](double *x, double *par)
     {
         double xx = x[0];
         double p_1
             = pdf_for_draw->Eval2G(xx, best_p1_mean, best_p1_sigma1, best_p1_sigma2, best_p1_frac1);
-        return nEntries * binWidth * ((1.0 - best_f_s) * best_f_1 * p_1);
+        return nTotFit * binWidth * ((1.0 - best_f_s) * best_f_1 * p_1);
     };
 
     auto scale_p2_lambda
-        = [pdf_for_draw, nEntries, binWidth, best_f_s, best_f_2, best_p2_mean, best_p2_sigma1,
+        = [pdf_for_draw, nTotFit, binWidth, best_f_s, best_f_2, best_p2_mean, best_p2_sigma1,
               best_p2_sigma2, best_p2_frac1](double *x, double *par)
     {
         double xx = x[0];
         double p_2
             = pdf_for_draw->Eval2G(xx, best_p2_mean, best_p2_sigma1, best_p2_sigma2, best_p2_frac1);
-        return nEntries * binWidth * ((1.0 - best_f_s) * best_f_2 * p_2);
+        return nTotFit * binWidth * ((1.0 - best_f_s) * best_f_2 * p_2);
     };
 
-    auto scale_argus_lambda = [pdf_for_draw, nEntries, binWidth, best_f_s, best_f_3, best_argus_m0,
+    auto scale_argus_lambda = [pdf_for_draw, nTotFit, binWidth, best_f_s, best_f_3, best_argus_m0,
                                   best_argus_c, best_argus_p](double *x, double *par)
     {
         double xx = x[0];
         double p_3 = pdf_for_draw->EvalArgus(xx, best_argus_m0, best_argus_c, best_argus_p);
-        return nEntries * binWidth * ((1.0 - best_f_s) * best_f_3 * p_3);
+        return nTotFit * binWidth * ((1.0 - best_f_s) * best_f_3 * p_3);
     };
 
     TF1 *f_draw = new TF1("f_draw", scale_pdf_lambda, xMin, xMax, 0);
@@ -1284,7 +1298,6 @@ void analysis::DoFullBlindedUnbinnedFit()
     cout << "=======================================================" << endl;
 
     // 1. Calcolo esatto delle efficienze binomiali dai MC
-    // ID 34 = D+ -> phi pi, ID 41 = Ds+ -> phi pi (Tabella 1: 50M generati ciascuno)
     const double n_gen_Dplus = 50.0e6;
     const double n_gen_Dsplus = 50.0e6;
 
@@ -1292,15 +1305,30 @@ void analysis::DoFullBlindedUnbinnedFit()
     long long n_pass_Dplus = 0;
     long long n_pass_Dsplus = 0;
 
+    // Usiamo nomi univoci (cutStringVal, formulaVal, currentTreeNumberVal) per evitare conflitti
+    TString cutStringVal = GetCutString(USE_OPTIMIZED_CUTS);
+    TTreeFormula formulaVal("cutVal", cutStringVal.Data(), fChain);
+    Int_t currentTreeNumberVal = -1;
+
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
         if(LoadTree(jentry) < 0)
             break;
+        if(fChain->GetTreeNumber() != currentTreeNumberVal)
+        {
+            currentTreeNumberVal = fChain->GetTreeNumber();
+            formulaVal.UpdateFormulaLeaves();
+        }
         fChain->GetEntry(jentry);
-        if(id == 34)
-            n_pass_Dplus++;
-        if(id == 41)
-            n_pass_Dsplus++;
+
+        // Conta solo gli eventi che superano i tagli attivi
+        if(formulaVal.EvalInstance() > 0)
+        {
+            if(id == 34)
+                n_pass_Dplus++;
+            if(id == 41)
+                n_pass_Dsplus++;
+        }
     }
 
     // Efficienze fisiche
@@ -1377,6 +1405,7 @@ void analysis::DoFullBlindedUnbinnedFit()
     LoadDataset(0);
 
     delete minimizer;
+    delete g_pdf_unbinned; // Dealloca l'oggetto prima di azzerare il puntatore
     g_pdf_unbinned = nullptr;
 }
 
@@ -1419,12 +1448,30 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     fGen.SetNpx(10000);
 
     // 4. Generazione del dataset locale al thread
-    g_data_events.clear();
-    // nEvents = threadRandom->Poisson(nEvents);
-    g_data_events.reserve(nEvents);
-    for(int ev = 0; ev < nEvents; ++ev)
+    TH1D *local_hist = nullptr; // Va distrutto alla fine del worker
+
+    if(USE_UNBINNED)
     {
-        g_data_events.push_back(fGen.GetRandom(&threadRandom));
+        g_data_events.clear();
+        g_data_events.reserve(nEvents);
+        for(int ev = 0; ev < nEvents; ++ev)
+        {
+            g_data_events.push_back(fGen.GetRandom(&threadRandom));
+        }
+    }
+    else
+    {
+        int nBins = std::round((xMax - xMin) / 0.0025);
+        local_hist = new TH1D(Form("h_toy_%d", toyId), "", nBins, xMin, xMax);
+        g_data_hist = local_hist;
+
+        // FLUTTUAZIONE POISSONIANA DI N_tot (Proprietà fondamentale dell'Extended Fit)
+        int nEventsFluct = USE_EXTENDED ? threadRandom.Poisson(nEvents) : nEvents;
+        for(int ev = 0; ev < nEventsFluct; ++ev)
+        {
+            double val = fGen.GetRandom(&threadRandom);
+            local_hist->Fill(val);
+        }
     }
 
     // 5. Setup locale del Minimizzatore
@@ -1433,7 +1480,9 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     minimizer->SetTolerance(0.01);
     minimizer->SetPrintLevel(-1); // Silenzioso
 
-    ROOT::Math::Functor fNLL(&Unbinned2NLL, 20);
+    int nPars = USE_EXTENDED ? 21 : 20;
+    ROOT::Math::Functor fNLL(
+        USE_EXTENDED ? &BinnedExtended2NLL : (USE_UNBINNED ? &Unbinned2NLL : &Binned2NLL), nPars);
     minimizer->SetFunction(fNLL);
 
     // =========================================================================
@@ -1495,6 +1544,11 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     minimizer->SetFixedVariable(17, "argus_m0", gen_pars[17]);
     minimizer->SetFixedVariable(18, "argus_c", gen_pars[18]);
     minimizer->SetFixedVariable(19, "argus_p", gen_pars[19]);
+
+    if(USE_EXTENDED)
+    {
+        minimizer->SetVariable(20, "N_tot", nEvents, std::sqrt(nEvents));
+    }
 
     minimizer->Minimize();
     // minimizer->Hesse(); // Abilitato per ottenere la matrice di covarianza accurata
@@ -1569,6 +1623,8 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
     }
 
     delete minimizer;
+    if(!USE_UNBINNED && local_hist)
+        delete local_hist; // Rimuove il TH1 allocato per questo toy
     g_pdf_unbinned = nullptr; // Reset
     return res;
 }
@@ -1576,6 +1632,9 @@ ToyResult RunSingleToy(int toyId, int nEvents, const FullUnbinnedPDF &templatePd
 ToyMetrics analysis::RunToyMC(int nToys, double true_fs)
 {
     auto start = std::chrono::high_resolution_clock::now();
+
+    ROOT::EnableThreadSafety();
+    TH1::AddDirectory(kFALSE);
 
     SetLBStyle();
     constexpr bool usePol1Bkg = false;
@@ -1606,16 +1665,31 @@ ToyMetrics analysis::RunToyMC(int nToys, double true_fs)
     long long n_pass_sig = 0;
     long long n_pass_norm = 0;
 
+    // Prepariamo la formula di selezione per il MC con nomi univoci (cutStringMC, formulaMC)
+    TString cutStringMC = GetCutString(USE_OPTIMIZED_CUTS);
+    TTreeFormula formulaMC("cutMC", cutStringMC.Data(), fChain);
+    Int_t treeNumMC = -1;
+
     Long64_t nentries_mc = fChain->GetEntries();
     for(Long64_t jentry = 0; jentry < nentries_mc; jentry++)
     {
         if(LoadTree(jentry) < 0)
             break;
+        if(fChain->GetTreeNumber() != treeNumMC)
+        {
+            treeNumMC = fChain->GetTreeNumber();
+            formulaMC.UpdateFormulaLeaves();
+        }
         fChain->GetEntry(jentry);
-        if(id == 44)
-            n_pass_sig++; // Ds+ -> tau+ nu_tau (Segnale)
-        if(id == 42)
-            n_pass_norm++; // Ds+ -> phi mu+ nu_mu (Normalizzazione)
+
+        // Conta solo se l'evento MC supera i tagli attivi
+        if(formulaMC.EvalInstance() > 0)
+        {
+            if(id == 44)
+                n_pass_sig++; // Ds+ -> tau+ nu_tau (Segnale)
+            if(id == 42)
+                n_pass_norm++; // Ds+ -> phi mu+ nu_mu (Normalizzazione)
+        }
     }
 
     double eff_sig = (double)n_pass_sig / n_gen_sig;
@@ -1645,9 +1719,9 @@ ToyMetrics analysis::RunToyMC(int nToys, double true_fs)
     if(!m_fit_done || m_fitted_pars.size() < 5)
     {
         cout << "[INFO] Parametri del fit reale non trovati. Esecuzione automatica di "
-                "DoFullBlindedUnbinnedFit()..."
+                "DoFullBlindedFit()..."
              << endl;
-        DoFullBlindedUnbinnedFit();
+        DoFullBlindedFit();
     }
 
     // Verifichiamo nuovamente se adesso il fit è presente e valido
@@ -1690,14 +1764,30 @@ ToyMetrics analysis::RunToyMC(int nToys, double true_fs)
 
     LoadDataset(0);
     int nEvents = 0;
+
+    // Prepariamo la formula di selezione per i dati reali con nomi univoci (cutStringData,
+    // formulaData)
+    TString cutStringData = GetCutString(USE_OPTIMIZED_CUTS);
+    TTreeFormula formulaData("cutData", cutStringData.Data(), fChain);
+    Int_t treeNumData = -1;
+
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
         if(LoadTree(jentry) < 0)
             break;
+        if(fChain->GetTreeNumber() != treeNumData)
+        {
+            treeNumData = fChain->GetTreeNumber();
+            formulaData.UpdateFormulaLeaves();
+        }
         fChain->GetEntry(jentry);
         if(id == 0 && D_M >= xMin && D_M <= xMax)
         {
-            nEvents++;
+            // Applica la selezione attiva prima di incrementare il conteggio eventi reali
+            if(formulaData.EvalInstance() > 0)
+            {
+                nEvents++;
+            }
         }
     }
     if(nEvents == 0)
@@ -1935,7 +2025,7 @@ ToyMetrics analysis::RunToyMC(int nToys, double true_fs)
     std::vector<double> diag_events;
     diag_events.reserve(nEvents);
     auto h_single_toy = new TH1D("h_single_toy",
-        "Single Toy Pseudo-Data Fit;Mass [GeV/#it{c}^{2}];Entries", 100, xMin, xMax);
+        "Single Toy Pseudo-Data Fit;Mass [GeV/#it{c}^{2}];Entries", 200, xMin, xMax);
     h_single_toy->SetDirectory(nullptr);
     AddBinSizeOnYTitle(h_single_toy, "GeV/#it{c}^{2}");
 
@@ -2134,8 +2224,8 @@ ToyMetrics analysis::RunToyMC(int nToys, double true_fs)
     getMetrics(h_fit_br, metrics.bias_br, metrics.res_br);
     getMetrics(h_fit_rtau, metrics.bias_rtau, metrics.res_rtau);
 
-    cout << Form(
-        "[TOY MC] f_s: Bias=%.2e, Res=%.2e | BR: Bias=%.2e, Res=%.2e | R_tau: Bias=%.2e, Res=%.2e",
+    cout << Form("[TOY MC] f_s: Bias=%.2e, Res=%.2e | BR: Bias=%.2e, Res=%.2e | R_tau: "
+                 "Bias=%.2e, Res=%.2e",
         metrics.bias_fs, metrics.res_fs, metrics.bias_br, metrics.res_br, metrics.bias_rtau,
         metrics.res_rtau)
          << endl;
@@ -2160,24 +2250,22 @@ struct FCPoint
     }
 };
 
-void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mode)
+void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mode,
+    const std::vector<double> &discrete_mu, const std::vector<double> &discrete_sigma)
 {
     SetLBStyle();
-
-    // Fissiamo univocamente il Confidence Level al 90% come richiesto dalle istruzioni
     constexpr double target_CL = 0.90;
 
-    // Range dinamico basato sul massimo valore esplorato nei Toy
     double mu_start = 0.0;
     double mu_end = max_val;
-    int n_steps = 200; // Numero di punti per rendere la curva liscia
+    int n_steps = 200;
     double mu_step = (mu_end - mu_start) / n_steps;
 
     std::vector<double> vec_mu, vec_x_lower, vec_x_upper;
 
-    cout << "\n--> Constructing Feldman-Cousins Belt Boundaries (" << (target_CL * 100)
-         << "% CL)..." << endl;
+    cout << "\n--> Constructing Feldman-Cousins Continuous Belt boundaries (90% CL)..." << endl;
 
+    // --- 1. CALCOLO BANDA CONTINUA (INTERPOLATA) ---
     for(double mu = mu_start; mu <= mu_end; mu += mu_step)
     {
         double sigma_mu = sigma0 + alpha * mu;
@@ -2189,29 +2277,12 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mo
 
         for(double x = x_start; x <= x_end; x += dx)
         {
-            double par[3] = { mu, sigma0, alpha };
+            double par[2] = { mu, sigma_mu };
             double prob_density = TMath::Gaus(x, mu, sigma_mu, kTRUE);
             double R = LROrdering(&x, par);
 
             points.push_back({ x, prob_density * dx, R });
         }
-        /*
-            double sigma = sigma0 + alpha * mu;
-
-            std::vector<FCPoint> points;
-            double dx = sigma / 200.0;
-            double x_start = mu - 5.0 * sigma;
-            double x_end = mu + 5.0 * sigma;
-
-            for(double x = x_start; x <= x_end; x += dx)
-            {
-            double par[2] = { mu, sigma };
-            double prob_density = TMath::Gaus(x, mu, sigma, true);
-            double R = LROrdering(&x, par);
-
-            points.push_back({ x, prob_density * dx, R });
-            }
-        */
         std::sort(points.begin(), points.end());
 
         double sum_prob = 0.0;
@@ -2234,7 +2305,54 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mo
         vec_x_upper.push_back(x_max);
     }
 
-    // --- DISEGNO DELLA BANDA ---
+    // --- 2. CALCOLO LIMITI SUI PUNTI DISCRETI DEI TOY ---
+    std::vector<double> vec_disc_x_lower, vec_disc_x_upper;
+    bool has_discrete = (!discrete_mu.empty() && discrete_mu.size() == discrete_sigma.size());
+
+    if(has_discrete)
+    {
+        cout << "--> Calculating Feldman-Cousins Discrete boundaries directly from Toy points..."
+             << endl;
+        for(size_t i = 0; i < discrete_mu.size(); ++i)
+        {
+            double mu = discrete_mu[i];
+            double sig = discrete_sigma[i];
+
+            std::vector<FCPoint> points;
+            double dx = sig / 200.0;
+            double x_start = mu - 5.0 * sig;
+            double x_end = mu + 5.0 * sig;
+
+            for(double x = x_start; x <= x_end; x += dx)
+            {
+                double par[2] = { mu, sig };
+                double prob_density = TMath::Gaus(x, mu, sig, kTRUE);
+                double R = LROrdering(&x, par);
+
+                points.push_back({ x, prob_density * dx, R });
+            }
+            std::sort(points.begin(), points.end());
+
+            double sum_prob = 0.0;
+            double x_min = 999.0;
+            double x_max = -999.0;
+
+            for(const auto &pt : points)
+            {
+                sum_prob += pt.prob;
+                if(pt.x < x_min)
+                    x_min = pt.x;
+                if(pt.x > x_max)
+                    x_max = pt.x;
+                if(sum_prob >= target_CL)
+                    break;
+            }
+            vec_disc_x_lower.push_back(x_min);
+            vec_disc_x_upper.push_back(x_max);
+        }
+    }
+
+    // --- COSTRUZIONE DEI GRAFICI ---
     int nPoints = vec_mu.size();
     std::vector<double> x_closed;
     std::vector<double> mu_closed;
@@ -2252,9 +2370,19 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mo
         mu_closed.push_back(vec_mu[i]);
     }
 
+    // Grafici continui
     TGraph *g_belt = new TGraph(x_closed.size(), &x_closed[0], &mu_closed[0]);
     TGraph *g_up = new TGraph(nPoints, &vec_x_lower[0], &vec_mu[0]);
     TGraph *g_low = new TGraph(nPoints, &vec_x_upper[0], &vec_mu[0]);
+
+    // Grafici discreti (vengono istanziati ma non disegnati sul Canvas corrente)
+    TGraph *g_up_discrete = nullptr;
+    TGraph *g_low_discrete = nullptr;
+    if(has_discrete)
+    {
+        g_up_discrete = new TGraph(discrete_mu.size(), &vec_disc_x_lower[0], &discrete_mu[0]);
+        g_low_discrete = new TGraph(discrete_mu.size(), &vec_disc_x_upper[0], &discrete_mu[0]);
+    }
 
     TString titleX, titleY, nameSuffix;
     int colBase;
@@ -2281,6 +2409,7 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mo
         colBase = kOrange + 1;
     }
 
+    // Stile Grafici Continui
     g_belt->SetFillColorAlpha(colBase - 9, 0.35);
     g_belt->SetLineWidth(0);
     g_up->SetLineColor(colBase + 1);
@@ -2288,6 +2417,7 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mo
     g_up->SetLineWidth(3);
     g_low->SetLineWidth(3);
 
+    // --- DISEGNO CANVAS PULITO (SOLO CONTURNO CONTINUO) ---
     TCanvas *cBelt
         = new TCanvas(Form("cBelt_%s", nameSuffix.Data()), "Feldman-Cousins Belt", 800, 800);
     cBelt->cd();
@@ -2316,12 +2446,41 @@ void analysis::ConstructBelt(double sigma0, double alpha, double max_val, int mo
     vert->Draw("SAME");
 
     cBelt->Update();
+
+    // --- SALVATAGGIO REALE DEI GRAFICI INDIPENDENTI SU FILE ROOT ---
+    TFile *fOut
+        = TFile::Open(Form("./_root/FC_Belt_Output_%s.root", nameSuffix.Data()), "RECREATE");
+    if(fOut && !fOut->IsZombie())
+    {
+        fOut->cd();
+
+        // Salvataggio dei grafici continui
+        g_belt->SetName("g_belt_interpolated");
+        g_belt->Write();
+        g_up->SetName("g_up_interpolated");
+        g_up->Write();
+        g_low->SetName("g_low_interpolated");
+        g_low->Write();
+
+        // Salvataggio dei grafici discreti (se presenti)
+        if(has_discrete)
+        {
+            g_up_discrete->SetName("g_up_discrete");
+            g_up_discrete->Write();
+            g_low_discrete->SetName("g_low_discrete");
+            g_low_discrete->Write();
+        }
+
+        cBelt->Write("cBelt_Canvas");
+        fOut->Close();
+        cout << "[INFO] File ROOT salvato con successo: "
+             << Form("./_root/FC_Belt_Output_%s.root", nameSuffix.Data()) << endl;
+    }
+
     if(savePlots)
     {
         cBelt->SaveAs(Form("./_fig/FeldmanCousinsBelt_%s.pdf", nameSuffix.Data()));
-        cBelt->SaveAs(Form("./_root/FeldmanCousinsBelt_%s.root", nameSuffix.Data()));
     }
-    cout << "Filled Belt (90% CL) successfully generated and saved!" << endl;
 }
 
 void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint)
@@ -2332,10 +2491,11 @@ void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint)
     // --- Controllo dinamico del Fit reale ---
     if(!m_fit_done || m_fitted_pars.size() < 4)
     {
-        cout << "[INFO] Parametri del fit reale non trovati per la pipeline. Esecuzione automatica "
-                "di DoFullBlindedUnbinnedFit()..."
+        cout << "[INFO] Parametri del fit reale non trovati per la pipeline. Esecuzione "
+                "automatica "
+                "di DoFullBlindedFit()..."
              << endl;
-        DoFullBlindedUnbinnedFit();
+        DoFullBlindedFit();
     }
 
     double true_f3;
@@ -2350,18 +2510,21 @@ void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint)
         return; // Interrompe la pipeline
     }
 
-    // Fattori nominali costanti
-    double r_eff = 0.2212;
+    // Calcolo dinamico di r_eff basato sul constexpr globale USE_OPTIMIZED_CUTS
+    double r_eff = GetMCEfficiencyRatio(USE_OPTIMIZED_CUTS);
+
     const double br_taunu_nom = 5.39e-2;
     const double br_phimunu_nom = 2.24e-2;
     double k_factor_nom = r_eff * (br_phimunu_nom / br_taunu_nom);
+
+    cout << Form("[INFO] r_eff dinamico calcolato dal MC: %.4f", r_eff) << endl;
 
     // Definiamo i punti nominali su f_s dinamicamente con un ciclo
     std::vector<double> fs_points;
 
     double fs_start = 0.0;
     double fs_end = 0.01;
-    double fs_step = 0.0010;
+    double fs_step = 0.0002;
     int n_steps = std::round((fs_end - fs_start) / fs_step) + 1;
     for(int i = 0; i < n_steps; ++i)
         fs_points.push_back(fs_start + i * fs_step);
@@ -2455,11 +2618,11 @@ void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint)
             cBias->SaveAs(Form("./_fig/SanityCheck_Bias_%s.pdf", name));
 
         // 3) Costruzione FC
-        ConstructBelt(sigma0, alpha, max_x, mode);
+        ConstructBelt(sigma0, alpha, max_x, mode, x, s);
     };
 
-    // Chiama la Pipeline per tutte e 3 le metriche (impostando le scale di conversione corrette per
-    // Minuit)
+    // Chiama la Pipeline per tutte e 3 le metriche (impostando le scale di conversione corrette
+    // per Minuit)
     processBeltMetrics(xt_fs, yb_fs, ys_fs, 0, 1e3, "fs");
     processBeltMetrics(xt_br, yb_br, ys_br, 1, 1e7, "BR");
     processBeltMetrics(xt_rtau, yb_rtau, ys_rtau, 2, 1e4, "Rtau");
@@ -2467,6 +2630,410 @@ void analysis::RunFeldmanCousinsPipeline(int nToysPerPoint)
     cout << "\n=======================================================" << endl;
     cout << "  PIPELINE FELDMAN COUSINS (FS, BR, R_TAU) COMPLETED!  " << endl;
     cout << "=======================================================" << endl;
+}
+
+void analysis::InterpolateDiscreteBelt(
+    const TString &nameSuffix, double smoothingSpan, bool overlayContinuous)
+{
+    // --- 1. CARICAMENTO DELLO STILE DI LORENZO ---
+    lbStyle::SetLBStyle();
+
+    TString fileName = Form("./_root/FC_Belt_Output_%s.root", nameSuffix.Data());
+    TFile *fIn = TFile::Open(fileName, "READ");
+    if(!fIn || fIn->IsZombie())
+    {
+        std::cerr << "[ERROR] Impossibile aprire il file ROOT: " << fileName << std::endl;
+        return;
+    }
+
+    TGraph *g_up_discrete_raw = (TGraph *)fIn->Get("g_up_discrete");
+    TGraph *g_low_discrete_raw = (TGraph *)fIn->Get("g_low_discrete");
+
+    if(!g_up_discrete_raw || !g_low_discrete_raw)
+    {
+        std::cerr << "[ERROR] Grafici discreti non trovati nel file ROOT!" << std::endl;
+        fIn->Close();
+        return;
+    }
+
+    // --- 2. RETRIEVAL LIMITI ASSI DALLA CANVAS SALVATA ---
+    double plot_x_min = 1e9;
+    double plot_x_max = -1e9;
+    bool foundSavedLimits = false;
+
+    TCanvas *cSaved = (TCanvas *)fIn->Get("cBelt_Canvas");
+    if(cSaved)
+    {
+        TObject *obj = cSaved->FindObject(Form("hFrame_%s", nameSuffix.Data()));
+        if(!obj)
+            obj = cSaved->GetPrimitive(Form("hFrame_%s", nameSuffix.Data()));
+
+        if(obj && obj->InheritsFrom("TH2"))
+        {
+            TH2 *hFrameSaved = (TH2 *)obj;
+            plot_x_min = hFrameSaved->GetXaxis()->GetXmin();
+            plot_x_max = hFrameSaved->GetXaxis()->GetXmax();
+            foundSavedLimits = true;
+            std::cout << "[INFO] Limiti asse X sincronizzati con il grafico continuo: ["
+                      << plot_x_min << ", " << plot_x_max << "]" << std::endl;
+        }
+    }
+
+    // --- 3. CARICAMENTO BANDA CONTINUA, LOG DI DIAGNOSTICA E AUTO-RISCALAMENTO ---
+    TGraph *g_up_interp = nullptr;
+    TGraph *g_low_interp = nullptr;
+    if(overlayContinuous)
+    {
+        TGraph *g_up_interp_raw = (TGraph *)fIn->Get("g_up_interpolated");
+        TGraph *g_low_interp_raw = (TGraph *)fIn->Get("g_low_interpolated");
+        if(g_up_interp_raw)
+            g_up_interp = (TGraph *)g_up_interp_raw->Clone();
+        if(g_low_interp_raw)
+            g_low_interp = (TGraph *)g_low_interp_raw->Clone();
+
+        if(g_up_interp && g_low_interp)
+        {
+            double max_x_val = -1e9;
+            double max_y_val = -1e9;
+            for(int i = 0; i < g_up_interp->GetN(); ++i)
+            {
+                double tx, ty;
+                g_up_interp->GetPoint(i, tx, ty);
+                if(tx > max_x_val)
+                    max_x_val = tx;
+                if(ty > max_y_val)
+                    max_y_val = ty;
+            }
+
+            // Stima del fattore di riscalamento dinamico asimmetrico
+            double factor_x = 1.0;
+            if(max_x_val > 1.0)
+            {
+                if(max_x_val > 1000.0)
+                    factor_x = 1e7;
+                else if(max_x_val > 10.0)
+                    factor_x = 1e3;
+                else
+                    factor_x = 1e4;
+            }
+
+            double factor_y = 1.0;
+            if(max_y_val > 1.0)
+            {
+                if(max_y_val > 1000.0)
+                    factor_y = 1e7;
+                else if(max_y_val > 10.0)
+                    factor_y = 1e3;
+                else
+                    factor_y = 1e4;
+            }
+
+            if(factor_x > 1.0 || factor_y > 1.0)
+            {
+                std::cout << "[INFO] Riscalamento dinamico rilevato -> Fattore X: " << factor_x
+                          << ", Fattore Y: " << factor_y << std::endl;
+                for(int i = 0; i < g_up_interp->GetN(); ++i)
+                {
+                    double tx_up, ty_up, tx_low, ty_low;
+                    g_up_interp->GetPoint(i, tx_up, ty_up);
+                    g_low_interp->GetPoint(i, tx_low, ty_low);
+
+                    g_up_interp->SetPoint(i, tx_up / factor_x, ty_up / factor_y);
+                    g_low_interp->SetPoint(i, tx_low / factor_x, ty_low / factor_y);
+                }
+            }
+
+            // SCRITTURA FILE DI LOG DIAGNOSTICO SU DISCO
+            std::ofstream debugFile("./_fig/FC_Belt_Debug_Points.txt");
+            if(debugFile.is_open())
+            {
+                debugFile << "=====================================================\n";
+                debugFile << "      DIAGNOSTIC LOG FOR CONTINUOUS RED CURVE POINTS \n";
+                debugFile << "=====================================================\n";
+                debugFile << "Name Suffix:    " << nameSuffix.Data() << "\n";
+                debugFile << "Number of points: " << g_up_interp->GetN() << "\n";
+                debugFile << "Max X found (before scaling): " << max_x_val << "\n";
+                debugFile << "Max Y found (before scaling): " << max_y_val << "\n\n";
+                debugFile << "LIST OF POINTS (after scaling applied in memory):\n";
+                for(int i = 0; i < g_up_interp->GetN(); ++i)
+                {
+                    double x_up, y_up, x_low, y_low;
+                    g_up_interp->GetPoint(i, x_up, y_up);
+                    g_low_interp->GetPoint(i, x_low, y_low);
+                    debugFile << Form(
+                        "  Point %3d:  UPPER (x = %e, y = %e)  |  LOWER (x = %e, y = %e)\n", i,
+                        x_up, y_up, x_low, y_low);
+                }
+                debugFile.close();
+                std::cout
+                    << "[DEBUG] Log delle coordinate salvato in: ./_fig/FC_Belt_Debug_Points.txt"
+                    << std::endl;
+            }
+        }
+    }
+
+    // Cloniamo i grafici discreti per svincolarli dal file ROOT
+    TGraph *g_up_discrete = (TGraph *)g_up_discrete_raw->Clone();
+    TGraph *g_low_discrete = (TGraph *)g_low_discrete_raw->Clone();
+    fIn->Close(); // Chiudiamo subito il file di lettura per evitare conflitti
+
+    int nPoints = g_up_discrete->GetN();
+
+    // --- 4. COSTRUZIONE DEI GRAFICI PARAMETRICI (Scambio X <-> Y) ---
+    TGraph *g_up_param = new TGraph(nPoints);
+    TGraph *g_low_param = new TGraph(nPoints);
+
+    for(int i = 0; i < nPoints; ++i)
+    {
+        double x_meas_up, y_true_up;
+        g_up_discrete->GetPoint(i, x_meas_up, y_true_up);
+        g_up_param->SetPoint(i, y_true_up, x_meas_up);
+
+        double x_meas_low, y_true_low;
+        g_low_discrete->GetPoint(i, x_meas_low, y_true_low);
+        g_low_param->SetPoint(i, y_true_low, x_meas_low);
+    }
+
+    g_up_param->Sort();
+    g_low_param->Sort();
+
+    // --- 5. LEVIGATURA LOWESS ---
+    TGraphSmooth *gs = new TGraphSmooth("fc_smoother");
+    TGraph *tmp_up = gs->SmoothLowess(g_up_param, "raw", smoothingSpan);
+    TGraph *g_up_param_smooth = (TGraph *)tmp_up->Clone("g_up_param_smooth");
+
+    TGraph *tmp_low = gs->SmoothLowess(g_low_param, "raw", smoothingSpan);
+    TGraph *g_low_param_smooth = (TGraph *)tmp_low->Clone("g_low_param_smooth");
+
+    // Blending morbido per raccordare i bordi ed eliminare lo scalino
+    int kBlend = 5;
+    if(nPoints < 15)
+        kBlend = nPoints / 3;
+
+    for(int i = 0; i < nPoints; ++i)
+    {
+        if(i < kBlend)
+        {
+            double weight = (double)i / kBlend;
+            double x_raw_up, y_raw_up, x_sm_up, y_sm_up;
+            g_up_param->GetPoint(i, x_raw_up, y_raw_up);
+            g_up_param_smooth->GetPoint(i, x_sm_up, y_sm_up);
+            g_up_param_smooth->SetPoint(i, x_sm_up, (1.0 - weight) * y_raw_up + weight * y_sm_up);
+
+            double x_raw_low, y_raw_low, x_sm_low, y_sm_low;
+            g_low_param->GetPoint(i, x_raw_low, y_raw_low);
+            g_low_param_smooth->GetPoint(i, x_sm_low, y_sm_low);
+            g_low_param_smooth->SetPoint(
+                i, x_sm_low, (1.0 - weight) * y_raw_low + weight * y_sm_low);
+        }
+        else if(i >= nPoints - kBlend)
+        {
+            double weight = (double)(nPoints - 1 - i) / kBlend;
+            double x_raw_up, y_raw_up, x_sm_up, y_sm_up;
+            g_up_param->GetPoint(i, x_raw_up, y_raw_up);
+            g_up_param_smooth->GetPoint(i, x_sm_up, y_sm_up);
+            g_up_param_smooth->SetPoint(i, x_sm_up, (1.0 - weight) * y_raw_up + weight * y_sm_up);
+
+            double x_raw_low, y_raw_low, x_sm_low, y_sm_low;
+            g_low_param->GetPoint(i, x_raw_low, y_raw_low);
+            g_low_param_smooth->GetPoint(i, x_sm_low, y_sm_low);
+            g_low_param_smooth->SetPoint(
+                i, x_sm_low, (1.0 - weight) * y_raw_low + weight * y_sm_low);
+        }
+    }
+
+    g_up_param_smooth->Sort();
+    g_low_param_smooth->Sort();
+
+    // --- 6. SPLINE CUBICA ---
+    TSpline3 spline_up("spline_up", g_up_param_smooth);
+    TSpline3 spline_low("spline_low", g_low_param_smooth);
+
+    // --- 7. CAMPIONAMENTO BANDA LISCIA ---
+    const int nFine = 1000;
+    TGraph *g_up_smooth = new TGraph(nFine);
+    g_up_smooth->SetName("g_up_discrete_interpolated");
+
+    TGraph *g_low_smooth = new TGraph(nFine);
+    g_low_smooth->SetName("g_low_discrete_interpolated");
+
+    double mu_min = g_up_param->GetX()[0];
+    double mu_max = g_up_param->GetX()[nPoints - 1];
+    double dmu = (mu_max - mu_min) / (nFine - 1);
+
+    for(int i = 0; i < nFine; ++i)
+    {
+        double mu = mu_min + i * dmu;
+        g_up_smooth->SetPoint(i, spline_up.Eval(mu), mu);
+        g_low_smooth->SetPoint(i, spline_low.Eval(mu), mu);
+    }
+
+    // Poligono della banda colorata
+    TGraph *g_belt_smooth = new TGraph(2 * nFine);
+    g_belt_smooth->SetName("g_belt_discrete_interpolated");
+
+    for(int i = 0; i < nFine; ++i)
+    {
+        double x, y;
+        g_up_smooth->GetPoint(i, x, y);
+        g_belt_smooth->SetPoint(i, x, y);
+    }
+    for(int i = 0; i < nFine; ++i)
+    {
+        double x, y;
+        g_low_smooth->GetPoint(nFine - 1 - i, x, y);
+        g_belt_smooth->SetPoint(nFine + i, x, y);
+    }
+
+    int colBase = kBlue;
+    if(nameSuffix == "BR")
+        colBase = kGreen;
+    else if(nameSuffix == "Rtau")
+        colBase = kOrange + 1;
+
+    g_belt_smooth->SetFillColorAlpha(colBase - 9, 0.45);
+    g_belt_smooth->SetLineWidth(0);
+    g_up_smooth->SetLineColor(colBase + 1);
+    g_up_smooth->SetLineWidth(3);
+    g_low_smooth->SetLineColor(colBase + 1);
+    g_low_smooth->SetLineWidth(3);
+
+    // --- 8. SALVATAGGIO DEI RISULTATI SU FILE ---
+    TFile *fOut = TFile::Open(fileName, "UPDATE");
+    if(fOut && !fOut->IsZombie())
+    {
+        g_up_smooth->Write("g_up_discrete_interpolated", TObject::kOverwrite);
+        g_low_smooth->Write("g_low_discrete_interpolated", TObject::kOverwrite);
+        g_belt_smooth->Write("g_belt_discrete_interpolated", TObject::kOverwrite);
+        fOut->Close();
+    }
+
+    // --- 9. DISEGNO CANVAS DI CONFRONTO ---
+    TCanvas *cCheck = new TCanvas(
+        Form("cCheck_Smooth_%s", nameSuffix.Data()), "Feldman-Cousins Smooth Belt", 800, 800);
+    cCheck->cd();
+    cCheck->SetGrid();
+
+    if(!foundSavedLimits)
+    {
+        double x_plot_min = 1e9;
+        double x_plot_max = -1e9;
+        for(int i = 0; i < nFine; ++i)
+        {
+            double x_up_val, x_low_val, y;
+            g_up_smooth->GetPoint(i, x_up_val, y);
+            g_low_smooth->GetPoint(i, x_low_val, y);
+            if(x_up_val < x_plot_min)
+                x_plot_min = x_up_val;
+            if(x_up_val > x_plot_max)
+                x_plot_max = x_up_val;
+            if(x_low_val < x_plot_min)
+                x_plot_min = x_low_val;
+            if(x_low_val > x_plot_max)
+                x_plot_max = x_low_val;
+        }
+        plot_x_min = x_plot_min - 0.15 * (x_plot_max - x_plot_min);
+        plot_x_max = x_plot_max + 0.15 * (x_plot_max - x_plot_min);
+    }
+
+    TString titleX = "Measured Value";
+    if(nameSuffix == "fs")
+        titleX = "Measured #hat{f}_{s}";
+    else if(nameSuffix == "BR")
+        titleX = "Measured #hat{#font[12]{B}}(#tau^{+}#rightarrow#phi#mu^{+})";
+    else if(nameSuffix == "Rtau")
+        titleX = "Measured #hat{R}_{#tau}";
+
+    TString titleY = "True Value";
+    if(nameSuffix == "fs")
+        titleY = "True f_{s}";
+    else if(nameSuffix == "BR")
+        titleY = "True #font[12]{B}";
+    else if(nameSuffix == "Rtau")
+        titleY = "True R_{#tau}";
+
+    TH2F *hFrame = new TH2F(Form("hFrame_smooth_%s", nameSuffix.Data()),
+        Form(";%s;%s", titleX.Data(), titleY.Data()), 100, plot_x_min, plot_x_max, 100, 0.0,
+        mu_max);
+
+    hFrame->SetStats(0);
+
+    // Configurazione font vettoriale 42
+    hFrame->GetXaxis()->SetLabelFont(42);
+    hFrame->GetXaxis()->SetLabelSize(0.04);
+    hFrame->GetXaxis()->SetTitleFont(42);
+    hFrame->GetXaxis()->SetTitleSize(0.045);
+    hFrame->GetXaxis()->SetTitleOffset(1.2);
+
+    hFrame->GetYaxis()->SetLabelFont(42);
+    hFrame->GetYaxis()->SetLabelSize(0.04);
+    hFrame->GetYaxis()->SetTitleFont(42);
+    hFrame->GetYaxis()->SetTitleSize(0.045);
+    hFrame->GetYaxis()->SetTitleOffset(1.5);
+
+    hFrame->Draw();
+
+    // 1. Disegna la banda discreta riempita
+    g_belt_smooth->Draw("F SAME");
+    g_up_smooth->Draw("L SAME");
+    g_low_smooth->Draw("L SAME");
+
+    // 2. Disegna i marker o sovrappone la curva continua basandosi sul booleano
+    if(overlayContinuous && g_up_interp && g_low_interp)
+    {
+        // FIX: Linea ROSSA SOLIDA spessa (Stile 1) + Marker Cerchio vuoto rosso per sicurezza
+        // assoluta
+        g_up_interp->SetLineColor(kRed);
+        g_up_interp->SetLineStyle(1);
+        g_up_interp->SetLineWidth(4);
+        g_up_interp->SetMarkerColor(kRed);
+        g_up_interp->SetMarkerStyle(24); // Cerchio vuoto
+        g_up_interp->SetMarkerSize(0.7);
+        g_up_interp->Draw("LP SAME"); // Disegna Linea + Punti
+
+        g_low_interp->SetLineColor(kRed);
+        g_low_interp->SetLineStyle(1);
+        g_low_interp->SetLineWidth(4);
+        g_low_interp->SetMarkerColor(kRed);
+        g_low_interp->SetMarkerStyle(24);
+        g_low_interp->SetMarkerSize(0.7);
+        g_low_interp->Draw("LP SAME");
+
+        // Aggiorna la legenda mostrando la linea solida rossa
+        TLegend *leg = new TLegend(0.18, 0.72, 0.58, 0.88);
+        leg->SetBorderSize(0);
+        leg->SetFillStyle(0);
+        leg->SetTextFont(42);
+        leg->SetTextSize(0.035);
+        leg->AddEntry(g_belt_smooth, "Discrete Belt (Toy MC + Spline)", "f");
+        leg->AddEntry(g_up_interp, "Continuous Belt (Resolution Extrap.)", "l");
+        leg->Draw("SAME");
+    }
+    else
+    {
+        // Mostra i marker se non facciamo il confronto
+        g_up_discrete->SetMarkerStyle(20);
+        g_up_discrete->SetMarkerColor(colBase + 1);
+        g_up_discrete->SetMarkerSize(0.9);
+        g_up_discrete->Draw("P SAME");
+
+        g_low_discrete->SetMarkerStyle(20);
+        g_low_discrete->SetMarkerColor(colBase + 1);
+        g_low_discrete->SetMarkerSize(0.9);
+        g_low_discrete->Draw("P SAME");
+    }
+
+    gPad->RedrawAxis();
+    cCheck->Update();
+
+    cCheck->SaveAs(Form("./_fig/FeldmanCousinsBelt_Smooth_%s.pdf", nameSuffix.Data()));
+
+    // Cleanup delle strutture temporanee
+    delete g_up_param;
+    delete g_low_param;
+    delete g_up_param_smooth;
+    delete g_low_param_smooth;
+    delete gs;
 }
 
 // ================================================================================
@@ -2492,7 +3059,7 @@ WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &tem
     g_pdf_unbinned = &localPdf;
 
     std::vector<double> null_gen_pars = gen_pars;
-    null_gen_pars[0] = 0.0; // Generazione rigorosamente sotto H0 (f_s = 0)
+    null_gen_pars[0] = 0.0; // Generazione sotto H0 (f_s = 0)
 
     auto gen_lambda = [&localPdf, &null_gen_pars](double *x, double *par)
     {
@@ -2502,11 +3069,32 @@ WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &tem
     TF1 fGen(Form("fGenWilks_%d", toyId), gen_lambda, xMin, xMax, 0);
     fGen.SetNpx(10000);
 
-    g_data_events.clear();
-    g_data_events.reserve(nEvents);
-    for(int ev = 0; ev < nEvents; ++ev)
+    TH1D *local_hist = nullptr; // Istogramma locale al thread
+
+    if(USE_UNBINNED)
     {
-        g_data_events.push_back(fGen.GetRandom(&threadRandom));
+        g_data_events.clear();
+        g_data_events.reserve(nEvents);
+        for(int ev = 0; ev < nEvents; ++ev)
+        {
+            g_data_events.push_back(fGen.GetRandom(&threadRandom));
+        }
+    }
+    else
+    {
+        int nBins = std::round((xMax - xMin) / 0.0025);
+        local_hist = new TH1D(Form("h_toy_wilks_%d", toyId), "", nBins, xMin, xMax);
+        g_data_hist = local_hist; // Passa il puntatore a Minuit
+
+        // FLUTTUAZIONE POISSONIANA DI N_tot (Proprietà fondamentale dell'Extended Fit)
+        int nEventsFluct = USE_EXTENDED ? threadRandom.Poisson(nEvents) : nEvents;
+
+        // Generazione esatta evento per evento
+        for(int ev = 0; ev < nEventsFluct; ++ev)
+        {
+            double val = fGen.GetRandom(&threadRandom);
+            local_hist->Fill(val);
+        }
     }
 
     // =========================================================================
@@ -2517,12 +3105,12 @@ WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &tem
     minAlt->SetTolerance(0.01);
     minAlt->SetPrintLevel(-1);
 
-    ROOT::Math::Functor fNLL(&Unbinned2NLL, 20);
+    int nPars = USE_EXTENDED ? 21 : 20;
+    ROOT::Math::Functor fNLL(
+        USE_EXTENDED ? &BinnedExtended2NLL : (USE_UNBINNED ? &Unbinned2NLL : &Binned2NLL), nPars);
     minAlt->SetFunction(fNLL);
 
-    // Definiamo f_s senza limiti: può fluttuare liberamente nel negativo
-    minAlt->SetVariable(0, "f_s", 0.0, 0.005);
-    // minAlt->SetVariableLimits(0, 0.0, 1.0); // <-- RIMOZIONE DEL LIMITE!
+    minAlt->SetVariable(0, "f_s", 0.0, 0.005); // f_s fluttua liberamente (anche nel negativo)
 
     minAlt->SetVariable(1, "f_1", gen_pars[1], 0.005);
     minAlt->SetVariable(2, "f_2", gen_pars[2], 0.005);
@@ -2539,11 +3127,16 @@ WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &tem
         minAlt->FixVariable(p);
     }
 
+    if(USE_EXTENDED)
+        minAlt->SetVariable(20, "N_tot", nEvents, std::sqrt(nEvents));
+
     minAlt->Minimize();
 
     if(minAlt->Status() != 0)
     {
         delete minAlt;
+        if(!USE_UNBINNED && local_hist)
+            delete local_hist; // <--- AGGIUNGI QUESTA
         g_pdf_unbinned = nullptr;
         return res;
     }
@@ -2578,12 +3171,17 @@ WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &tem
         minNull->FixVariable(p);
     }
 
+    if(USE_EXTENDED)
+        minNull->SetVariable(20, "N_tot", nEvents, std::sqrt(nEvents));
+
     minNull->Minimize();
 
     if(minNull->Status() != 0)
     {
         delete minAlt;
         delete minNull;
+        if(!USE_UNBINNED && local_hist)
+            delete local_hist; // <--- AGGIUNGI QUESTA
         g_pdf_unbinned = nullptr;
         return res;
     }
@@ -2592,13 +3190,27 @@ WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &tem
 
     res.converged = true;
     res.fs_fitted = fs_fitted;
-    res.delta_F = F_0 - F_min;
+
+    // =========================================================================
+    // TRUCCO UNILATERALE (One-Sided Wilks)
+    // =========================================================================
+    if(fs_fitted >= 0.0)
+    {
+        res.delta_F = F_0 - F_min;
+    }
+    else
+    {
+        res.delta_F = 0.0; // Se f_s fittato < 0, il minimo fisico vincolato a f_s >= 0 è a 0,
+                           // quindi F_0 - F_min = 0
+    }
 
     if(res.delta_F < 0.0)
         res.delta_F = 0.0;
 
     delete minAlt;
     delete minNull;
+    if(!USE_UNBINNED && local_hist)
+        delete local_hist; // <--- AGGIUNGI QUESTA
     g_pdf_unbinned = nullptr;
     return res;
 }
@@ -2606,6 +3218,9 @@ WilksResult RunSingleWilksToy(int toyId, int nEvents, const FullUnbinnedPDF &tem
 void analysis::VerifyWilksTheorem(int nToys)
 {
     auto start = std::chrono::high_resolution_clock::now();
+    ROOT::EnableThreadSafety();
+    TH1::AddDirectory(kFALSE);
+
     SetLBStyle();
     constexpr bool usePol1Bkg = false;
 
@@ -2627,7 +3242,39 @@ void analysis::VerifyWilksTheorem(int nToys)
         return;
     }
 
-    std::vector<double> gen_pars = { 0.0, 0.026, 0.051, 0.625, -1.145, res_sig.params[1],
+    // --- [STEP 2] Caricamento dinamico dei parametri dal fit reale ---
+    if(!m_fit_done || m_fitted_pars.size() < 5)
+    {
+        cout << "[INFO] Parametri del fit reale non trovati per Wilks. Esecuzione automatica "
+                "di DoFullBlindedFit()..."
+             << endl;
+        DoFullBlindedFit();
+    }
+
+    double true_f1, true_f2, true_f3, true_slope;
+
+    if(m_fit_done && m_fitted_pars.size() >= 5)
+    {
+        true_f1 = m_fitted_pars[1];
+        true_f2 = m_fitted_pars[2];
+        true_f3 = m_fitted_pars[3];
+        true_slope = m_fitted_pars[4];
+        cout << "[INFO] Validazione di Wilks configurata con i parametri del fit reale:" << endl;
+        cout << Form("  f1 = %.4f | f2 = %.4f | f3 = %.4f | slope = %.4f", true_f1, true_f2,
+            true_f3, true_slope)
+             << endl;
+    }
+    else
+    {
+        cerr << "[ERROR] Impossibile verificare il teorema di Wilks: il fit di calibrazione "
+                "ha restituito parametri non validi."
+             << endl;
+        TF1::DefaultAddToGlobalList(kTRUE);
+        return;
+    }
+
+    // fs_gen = 0.0 per generare sotto l'ipotesi nulla H0
+    std::vector<double> gen_pars = { 0.0, true_f1, true_f2, true_f3, true_slope, res_sig.params[1],
         res_sig.params[2], res_sig.params[3], res_sig.params[4], res_p1.params[1], res_p1.params[2],
         res_p1.params[3], res_p1.params[4], res_p2.params[1], res_p2.params[2], res_p2.params[3],
         res_p2.params[4], res_arg.params[1], res_arg.params[2], res_arg.params[3] };
@@ -2636,24 +3283,40 @@ void analysis::VerifyWilksTheorem(int nToys)
     Double_t xMax = 2.10;
     FullUnbinnedPDF templatePdf(xMin, xMax, res_sig, res_p1, res_p2, res_arg, usePol1Bkg);
 
-    // Conteggio eventi totali dai dati reali
+    // Conteggio eventi totali dai dati reali sotto i tagli attivi
     LoadDataset(0);
     int nEvents = 0;
+
+    TString cutString = GetCutString(USE_OPTIMIZED_CUTS);
+    TTreeFormula formula("cut", cutString.Data(), fChain);
+    Int_t currentTreeNumber = -1;
+
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
         if(LoadTree(jentry) < 0)
             break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formula.UpdateFormulaLeaves();
+        }
         fChain->GetEntry(jentry);
         if(id == 0 && D_M >= xMin && D_M <= xMax)
-            nEvents++;
+        {
+            if(formula.EvalInstance() > 0)
+            {
+                nEvents++;
+            }
+        }
     }
     if(nEvents == 0)
         nEvents = 10000;
 
+    // --- [STEP 3] Esecuzione parallela dei Toy pseudo-esperimenti ---
     int nCores = static_cast<int>(std::thread::hardware_concurrency());
     if(nCores == 0)
         nCores = 4;
-    cout << "[INFO] Launching " << nToys << " Unconstrained Wilks Toys on " << nCores << " cores."
+    cout << "[INFO] Launching " << nToys << " One-Sided Wilks Toys on " << nCores << " cores."
          << endl;
 
     std::vector<WilksResult> wilksResults;
@@ -2676,54 +3339,73 @@ void analysis::VerifyWilksTheorem(int nToys)
              << flush;
     }
 
-    // --- [STEP 2] Booking Istogramma per Delta_F ---
-    TH1D *h_delta_F = new TH1D(
-        "h_delta_F", "Wilks Theorem Check;#Delta F = F_{0} - F_{min};Toys", 50, 0.0, 10.0);
+    // --- [STEP 4] Booking e riempimento Istogramma ---
+    TH1D *h_delta_F = new TH1D("h_delta_F",
+        "One-Sided Wilks Theorem Check;#Delta F = F_{0} - F_{min};Toys", 50, 0.0, 10.0);
     h_delta_F->SetDirectory(nullptr);
 
     int convergedToys = 0;
+    int zeroToys = 0;
     for(const auto &res : wilksResults)
     {
         if(res.converged)
         {
             convergedToys++;
             h_delta_F->Fill(res.delta_F);
+            if(res.delta_F <= 0.0)
+                zeroToys++;
         }
     }
 
     cout << "\n[WILKS RESULTS] Converged: " << convergedToys << " / " << nToys << endl;
+    cout << Form("  Toys with Delta_F = 0 (Physical boundary): %d (%.1f%%, Expected ~50%%)",
+        zeroToys, (double)zeroToys / convergedToys * 100.0)
+         << endl;
 
-    // --- [STEP 3] Plotting e Overplot Teorico con Residui (Pulls) ---
-    TCanvas *cWilks = new TCanvas("cWilks", "Wilks Theorem Validation with Pulls", 900, 900);
+    // --- [STEP 5] Plotting e Overplot Teorico Unilaterale con Residui ---
+    TCanvas *cWilks
+        = new TCanvas("cWilks", "One-Sided Wilks Theorem Validation with Pulls", 900, 900);
     double splitPoint = 0.30;
 
-    // Pad Superiore (Plot Principale)
     TPad *pad1 = new TPad("pad1", "Main Pad", 0.0, splitPoint, 1.0, 1.0);
-    pad1->SetBottomMargin(0.02); // Tocca il pad inferiore senza spazio bianco
+    pad1->SetBottomMargin(0.02);
     pad1->Draw();
     pad1->cd();
     pad1->SetGrid();
 
     h_delta_F->SetMinimum(0.0);
-    h_delta_F->GetXaxis()->SetLabelSize(0); // Nascondiamo l'asse X superiore
+    h_delta_F->GetXaxis()->SetLabelSize(0);
     h_delta_F->GetXaxis()->SetTitleSize(0);
     h_delta_F->SetMarkerStyle(20);
     h_delta_F->SetMarkerSize(1.0);
     h_delta_F->Draw("E P");
 
-    // 1. Definisci la PDF pura (SENZA la larghezza del bin nella normalizzazione)
-    // Nota: parto da > 0 per evitare il div by zero nei calcoli interni di ROOT,
-    // ma l'integrale ROOT lo gestirà benissimo
-    TF1 *f_chi2_theory
-        = new TF1("f_chi2_theory", "[0] * exp(-0.5*x) / sqrt(2.0 * TMath::Pi() * x)", 1e-6, 10.0);
-    f_chi2_theory->SetNpx(1000);
-
-    // Normalizzazione = solo numero totale di toy
+    // 1. PDF teorica unilaterale (Chernoff) per il calcolo matematico
+    TF1 *f_chi2_theory = new TF1(
+        "f_chi2_theory",
+        [](double *x, double *p)
+        {
+            if(x[0] <= 1e-6)
+                return 0.0;
+            return 0.5 * p[0] * std::exp(-0.5 * x[0]) / std::sqrt(2.0 * TMath::Pi() * x[0]);
+        },
+        1e-6, 10.0, 1);
     f_chi2_theory->SetParameter(0, convergedToys);
 
-    // 2. Per disegnare la curva continua riscalata ai bin (solo per la vista)
-    TF1 *f_chi2_draw = (TF1 *)f_chi2_theory->Clone("f_chi2_draw");
+    // 2. Curva teorica indipendente per l'istogramma, riscalata per la larghezza del bin
+    TF1 *f_chi2_draw = new TF1(
+        "f_chi2_draw",
+        [](double *x, double *p)
+        {
+            if(x[0] <= 1e-6)
+                return 0.0;
+            return 0.5 * p[0] * std::exp(-0.5 * x[0]) / std::sqrt(2.0 * TMath::Pi() * x[0]);
+        },
+        1e-6, 10.0, 1);
+
+    // Impostiamo esplicitamente p[0] = N * BinWidth
     f_chi2_draw->SetParameter(0, convergedToys * h_delta_F->GetBinWidth(1));
+    f_chi2_draw->SetNpx(5000); // Campionamento fit ad alta risoluzione
     f_chi2_draw->SetLineColor(kRed);
     f_chi2_draw->SetLineWidth(3);
     f_chi2_draw->Draw("SAME");
@@ -2734,14 +3416,15 @@ void analysis::VerifyWilksTheorem(int nToys)
     leg->SetTextFont(42);
     leg->SetTextSize(0.03);
     leg->AddEntry(h_delta_F, Form("Toy MC under H_{0} (%d toys)", convergedToys), "ep");
-    leg->AddEntry(f_chi2_theory, "Pure Wilks Theory: #chi^{2}_{1}(#Delta F)", "l");
+    leg->AddEntry(f_chi2_theory,
+        "One-Sided Theory: #frac{1}{2}#delta(0) + #frac{1}{2}#chi^{2}_{1}(#Delta F)", "l");
     leg->Draw("SAME");
 
-    // Pad Inferiore (Plot dei Residui / Pulls)
+    // Pad Inferiore (Residui / Pull)
     cWilks->cd();
     TPad *pad2 = new TPad("pad2", "Pull Pad", 0.0, 0.0, 1.0, splitPoint);
     pad2->SetTopMargin(0.02);
-    pad2->SetBottomMargin(0.35); // Spazio per i titoli dell'asse X
+    pad2->SetBottomMargin(0.35);
     pad2->SetGridy();
     pad2->Draw();
     pad2->cd();
@@ -2755,15 +3438,26 @@ void analysis::VerifyWilksTheorem(int nToys)
         double binLow = h_delta_F->GetXaxis()->GetBinLowEdge(i);
         double binUp = h_delta_F->GetXaxis()->GetBinUpEdge(i);
 
-        // 1. Calcolo analitico esatto della frazione tramite la CDF (senza integrazione numerica)
-        double fraction = TMath::Erf(std::sqrt(binUp / 2.0)) - TMath::Erf(std::sqrt(binLow / 2.0));
-        double exp = convergedToys * fraction;
+        double exp = 0.0;
+        if(binLow <= 0.0)
+        {
+            // Primo bin: contiene la Delta di Dirac (50%) + l'integrale della coda da 0 a binUp
+            double fraction = 0.5 + 0.5 * std::erf(std::sqrt(binUp / 2.0));
+            exp = convergedToys * fraction;
+        }
+        else
+        {
+            // Bin successivi: contengono solo la coda della chi2_1 riscalata di 0.5
+            double fraction
+                = 0.5 * (std::erf(std::sqrt(binUp / 2.0)) - std::erf(std::sqrt(binLow / 2.0)));
+            exp = convergedToys * fraction;
+        }
 
         if(err > 0.0)
         {
             double pull = (obs - exp) / err;
             hPull->SetBinContent(i, pull);
-            hPull->SetBinError(i, 0.0); // Nessuna barra d'errore sul punto del pull
+            hPull->SetBinError(i, 0.0);
         }
         else
         {
@@ -2775,7 +3469,7 @@ void analysis::VerifyWilksTheorem(int nToys)
     hPull->GetYaxis()->SetTitleSize(gStyle->GetTitleSize("Y") * 0.8);
     hPull->GetYaxis()->SetLabelSize(gStyle->GetLabelSize("Y") * 0.8);
     hPull->GetYaxis()->SetTitleOffset(gStyle->GetTitleOffset("Y") * 1.2);
-    hPull->GetYaxis()->SetRangeUser(-5.0, 5.0); // I pull oscillano tipicamente tra -3 e 3
+    hPull->GetYaxis()->SetRangeUser(-5.0, 5.0);
 
     hPull->GetXaxis()->SetTitle("#Delta F = F_{0} - F_{min}");
     hPull->GetXaxis()->SetTitleSize(gStyle->GetTitleSize("X") * 0.8);
@@ -2788,27 +3482,18 @@ void analysis::VerifyWilksTheorem(int nToys)
     hPull->SetLineColor(kBlack);
     hPull->Draw("P");
 
-    // Linea di riferimento a Zero
     TLine *line0 = new TLine(0.0, 0.0, 10.0, 0.0);
     line0->SetLineColor(kRed);
     line0->SetLineWidth(2);
     line0->Draw("SAME");
 
     cWilks->Update();
-    cWilks->SaveAs("./_fig/SanityCheck_Wilks_Pure.pdf");
-    cWilks->SaveAs("./_root/SanityCheck_Wilks_Pure.root");
-
-    while(gROOT->GetListOfCanvases()->FindObject("cWilks"))
-    {
-        gSystem->ProcessEvents(); // Gestisce i movimenti del mouse, zoom, click, ecc.
-        gSystem->Sleep(50); // Dorme 50 millisecondi per non sovraccaricare la CPU
-    }
+    cWilks->SaveAs("./_fig/SanityCheck_Wilks_OneSided.pdf");
+    cWilks->SaveAs("./_root/SanityCheck_Wilks_OneSided.root");
 
     // =========================================================================
-    // CALCOLO DELLA CDF ED ESECUZIONE DEL TEST DI KOLMOGOROV-SMIRNOV (UNBINNED)
+    // [STEP 6] CDF CON CORRETTA GESTIONE DEL FATTORE 1/2 E DEI TIES (TEST KS COMPLETO)
     // =========================================================================
-
-    // 1. Raccogliamo i Delta F dei toy convertiti e ordiniamoli
     std::vector<double> toy_deltas;
     toy_deltas.reserve(convergedToys);
     for(const auto &res : wilksResults)
@@ -2820,19 +3505,27 @@ void analysis::VerifyWilksTheorem(int nToys)
     }
     std::sort(toy_deltas.begin(), toy_deltas.end());
 
-    // 2. Calcolo manuale e rigoroso della statistica KS (D_max)
     double max_D = 0.0;
     int N = toy_deltas.size();
 
-    TGraph *g_cdf_emp = new TGraph(N); // Grafico per la CDF sperimentale (dei toy)
+    TGraph *g_cdf_emp = new TGraph(N);
 
     for(int i = 0; i < N; ++i)
     {
         double x = toy_deltas[i];
-        double f_emp = (double)(i + 1) / N; // CDF empirica: frazione di toy <= x
-        double f_theo = TMath::Erf(std::sqrt(x / 2.0)); // CDF teorica del Chi2(1)
 
+        // --- GESTIONE DEI "TIES" (OSSERVAZIONI RIPETUTE A ZERO) ---
+        int last_idx = i;
+        while(last_idx + 1 < N && std::abs(toy_deltas[last_idx + 1] - x) < 1e-9)
+        {
+            last_idx++;
+        }
+
+        double f_emp = (double)(last_idx + 1) / N;
         g_cdf_emp->SetPoint(i, x, f_emp);
+
+        // CDF Teorica Unilaterale Completa (Chernoff)
+        double f_theo = 0.5 + 0.5 * std::erf(std::sqrt(x / 2.0));
 
         double diff = std::abs(f_emp - f_theo);
         if(diff > max_D)
@@ -2841,11 +3534,10 @@ void analysis::VerifyWilksTheorem(int nToys)
         }
     }
 
-    // Calcoliamo il p-value di Kolmogorov-Smirnov usando la libreria di ROOT
+    // Calcolo corretto del p-value del test KS
     double ks_p_value = TMath::KolmogorovProb(max_D * std::sqrt(N));
-
     std::cout << "\n=======================================================" << endl;
-    std::cout << "   KOLMOGOROV-SMIRNOV TEST RESULTS (UNBINNED)" << endl;
+    std::cout << "   KOLMOGOROV-SMIRNOV TEST RESULTS (ONE-SIDED WITH 1/2)" << endl;
     std::cout << "=======================================================" << endl;
     std::cout << Form("  Number of Toys (N):  %d", N) << endl;
     std::cout << Form("  KS Distance (d_max): %.4f", max_D) << endl;
@@ -2853,26 +3545,26 @@ void analysis::VerifyWilksTheorem(int nToys)
               << endl;
     std::cout << "=======================================================\n" << endl;
 
-    // 3. Creazione del Canvas per il Plot della CDF
-    TCanvas *cCDF = new TCanvas("cCDF", "Cumulative Distribution Function & KS Test", 800, 600);
+    TCanvas *cCDF
+        = new TCanvas("cCDF", "Cumulative Distribution Function & KS Test (One-Sided)", 800, 600);
     cCDF->cd();
     cCDF->SetGrid();
 
-    // Creiamo un frame per gli assi (asse Y va rigorosamente da 0 a 1 per una probabilità)
     TH2F *hFrameCDF = new TH2F("hFrameCDF",
-        "Wilks Theorem Validation (CDF);#Delta F = F_{0} - F_{min};Cumulative Probability", 100,
+        "One-Sided Wilks Validation (CDF);#Delta F = F_{0} - F_{min};Cumulative Probability", 100,
         0.0, 10.0, 100, 0.0, 1.05);
     hFrameCDF->SetStats(0);
     hFrameCDF->Draw();
 
-    // Disegniamo la CDF teorica (Chi2 a 1 grado di libertà)
-    TF1 *f_cdf_theo = new TF1("f_cdf_theo", "TMath::Erf(std::sqrt(x/2.0))", 0.0, 10.0);
-    f_cdf_theo->SetNpx(1000);
+    // Disegniamo la CDF teorica unilaterale tramite Lambda C++ compilata
+    TF1 *f_cdf_theo = new TF1(
+        "f_cdf_theo",
+        [](double *x, double *p) { return 0.5 + 0.5 * std::erf(std::sqrt(x[0] / 2.0)); }, 0.0, 10.0,
+        0);
     f_cdf_theo->SetLineColor(kRed);
     f_cdf_theo->SetLineWidth(3);
     f_cdf_theo->Draw("SAME");
 
-    // Disegniamo la CDF empirica dei tuoi Toy
     g_cdf_emp->SetMarkerStyle(20);
     g_cdf_emp->SetMarkerSize(0.6);
     g_cdf_emp->SetMarkerColor(kBlack);
@@ -2880,32 +3572,29 @@ void analysis::VerifyWilksTheorem(int nToys)
     g_cdf_emp->SetLineWidth(1);
     g_cdf_emp->Draw("P SAME");
 
-    // Legenda con font e dimensione forzati a valori relativi sicuri
     TLegend *legCDF = new TLegend(0.15, 0.70, 0.55, 0.85);
     legCDF->SetBorderSize(1);
     legCDF->SetFillColor(kWhite);
-    legCDF->SetTextFont(42); // Font 42 (dimensione relativa, non in pixel)
-    legCDF->SetTextSize(0.035); // 3.5% dell'altezza della finestra (molto sicuro)
+    legCDF->SetTextFont(42);
+    legCDF->SetTextSize(0.035);
     legCDF->AddEntry(g_cdf_emp, Form("Toy MC under H_{0} (%d toys)", N), "ep");
-    legCDF->AddEntry(f_cdf_theo, "Pure Wilks Theory: F_{#chi^{2}_{1}}(#Delta F)", "l");
+    legCDF->AddEntry(f_cdf_theo, "One-Sided Theory: F_{#chi^{2}_{1s}}(\\Delta F)", "l");
     legCDF->Draw("SAME");
 
-    // Box di testo KS con font e dimensione forzati
     TPaveText *paveKS = new TPaveText(0.55, 0.15, 0.88, 0.32, "NDC");
     paveKS->SetBorderSize(1);
     paveKS->SetFillColor(kWhite);
-    paveKS->SetTextFont(42); // Font 42
-    paveKS->SetTextSize(0.035); // Dimensione del testo 3.5%
-    paveKS->SetTextAlign(12); // Allineamento a sinistra
+    paveKS->SetTextFont(42);
+    paveKS->SetTextSize(0.035);
+    paveKS->SetTextAlign(12);
     paveKS->AddText(Form("KS d_{max} = %.4f", max_D));
     paveKS->AddText(Form("KS p-value = %.4f", ks_p_value));
     paveKS->Draw();
 
     cCDF->Update();
-    cCDF->SaveAs("./_fig/SanityCheck_Wilks_CDF.pdf");
-    cCDF->SaveAs("./_root/SanityCheck_Wilks_CDF.root");
+    cCDF->SaveAs("./_fig/SanityCheck_Wilks_CDF_OneSided.pdf");
+    cCDF->SaveAs("./_root/SanityCheck_Wilks_CDF_OneSided.root");
 
-    // --- CICLO DI ATTESA PER TENERLO APERTO ---
     std::cout << "--> Grafico CDF pronto! Chiudi la finestra del CDF per proseguire." << std::endl;
     while(gROOT->GetListOfCanvases()->FindObject("cCDF"))
     {
@@ -2917,11 +3606,11 @@ void analysis::VerifyWilksTheorem(int nToys)
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Wilks validation completed in " << elapsed.count() << " seconds." << std::endl;
 
-    // --- RIPRISTINO DELLO STATO GLOBALE DI ROOT ---
     TF1::DefaultAddToGlobalList(kTRUE);
 
     delete h_delta_F;
     delete f_chi2_theory;
+    delete f_chi2_draw;
     delete leg;
     delete hPull;
     delete line0;
@@ -2932,34 +3621,16 @@ void analysis::VerifyWilksTheorem(int nToys)
 // CheckCut: Utility to test offline selection cuts on BLINDED Real Data
 // ================================================================================
 
-// ==========================================================
-// 1. Tagli sui due candidati Kaoni (h1 e h2)
-// ==========================================================
 const TString cut_kaons = "(h1_pt > 0.450 && h2_pt > 0.450) && "
                           "(h1_p > 3.0 && h2_p > 3.0) && "
                           "(h1_eta > 2.0 && h1_eta < 4.2) && (h2_eta > 2.0 && h2_eta < 4.2) && "
                           "(h1_IP > 60e-6 && h2_IP > 60e-6)";
-
-// ==========================================================
-// 2. Tagli sul candidato Muone (h3)
-// ==========================================================
 const TString cut_muon = "h3_pt > 0.350 && h3_p > 3.0 && "
                          "(h3_eta > 2.0 && h3_eta < 4.2) && "
                          "h3_IP > 90e-6 && h3_MuonID == 1";
-
-// ==========================================================
-// 3. Tagli sulla risonanza intermedia Phi (M0)
-// ==========================================================
 const TString cut_phi = "M0_pt > 0.9";
-
-// ==========================================================
-// 4. Tagli sul parent 3-corpi tau/D (D)
-// ==========================================================
 const TString cut_parent = "D_pt > 2.5 && D_time > 0.25e-12 && (D_M > 1.6 && D_M < 2.1)";
-
-// ==========================================================
-// TAGLIO COMBINATO (BASELINE DEL PDF TAB. 2)
-// ==========================================================
+// --- TAGLIO COMBINATO (BASELINE DEL PDF TAB. 2) ---
 const TString cut_baseline = cut_kaons + " && " + cut_muon + " && " + cut_phi + " && " + cut_parent;
 
 void analysis::CheckCut(const TString &cutString)
@@ -3061,7 +3732,6 @@ void analysis::CheckCut(const TString &cutString)
     h_after_blind->SetMarkerColor(kRed);
     h_after_blind->SetMarkerStyle(21);
     h_after_blind->SetMarkerSize(0.8);
-    h_after_blind->SetFillColorAlpha(kRed, 0.3);
 
     // 7. Disegno
     TCanvas *cCut = new TCanvas("cCut", "Cut Effect Validation", 800, 600);
@@ -3149,55 +3819,22 @@ void analysis::CheckCut(const TString &cutString)
     delete h_after;
 }
 
-// ================================================================================
-// EvaluateFOM: Calculates Signal Efficiency over Sqrt(Bkg)
-// ================================================================================
-double analysis::EvaluateFOM(const TString &cutString)
+double analysis::EvaluateFOM(const TString &cutString, double a_param)
 {
-    // Regioni di massa
-    Double_t xMin = 1.65;
-    Double_t xMax = 2.09;
+    Double_t xMin = 1.777 - 12 * 0.0058;
+    Double_t xMax = 1.777 + 12 * 0.0058;
     Double_t blindMin = 1.777 - 3 * 0.0058;
     Double_t blindMax = 1.777 + 3 * 0.0058;
 
-    // 1. STIMA DEL BACKGROUND (B) DAI DATI REALI (Sidebands)
-    LoadDataset(0);
-    TTreeFormula formulaData("cutData", cutString.Data(), fChain);
-
-    int B_before = 0;
-    int B_after = 0;
-    Int_t currentTreeNumber = -1;
-
-    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
-    {
-        if(LoadTree(jentry) < 0)
-            break;
-        if(fChain->GetTreeNumber() != currentTreeNumber)
-        {
-            currentTreeNumber = fChain->GetTreeNumber();
-            formulaData.UpdateFormulaLeaves();
-        }
-        fChain->GetEntry(jentry);
-
-        if(id != 0)
-            continue;
-        if(D_M >= blindMin && D_M <= blindMax)
-            continue; // Solo sidebands
-        if(D_M < xMin || D_M > xMax)
-            continue;
-
-        B_before++;
-        if(formulaData.EvalInstance() > 0)
-            B_after++;
-    }
-
-    // 2. STIMA DEL SEGNALE (S) DAL MONTE CARLO
+    // =========================================================================
+    // 1. STIMA EFFICIENZA SEGNALE (S) DAL MONTE CARLO
+    // =========================================================================
     LoadDataset(1);
     TTreeFormula formulaMC("cutMC", cutString.Data(), fChain);
 
     int S_before = 0;
     int S_after = 0;
-    currentTreeNumber = -1;
+    Int_t currentTreeNumber = -1;
 
     for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
@@ -3211,30 +3848,94 @@ double analysis::EvaluateFOM(const TString &cutString)
         fChain->GetEntry(jentry);
 
         if(id != 44)
-            continue; // Ds -> tau nu
+            continue;
 
         S_before++;
         if(formulaMC.EvalInstance() > 0)
+        {
             S_after++;
+        }
     }
 
-    // 3. CALCOLO DELLA FOM
     double eff_sig = (S_before > 0) ? (double)S_after / S_before : 0.0;
-    double fom = 0.0;
-    if(B_after > 0)
+    if(eff_sig <= 0.0)
+        return 0.0;
+
+    // =========================================================================
+    // 2. STIMA DEL FONDO INTERPOLATO (B) DAI DATI REALI
+    // =========================================================================
+    LoadDataset(0);
+    TTreeFormula formulaData("cutData", cutString.Data(), fChain);
+
+    TH1D *h_mass_bkg = new TH1D("h_mass_bkg", "Mass Bkg", 50, xMin, xMax);
+    h_mass_bkg->SetDirectory(nullptr);
+
+    currentTreeNumber = -1;
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
     {
-        fom = eff_sig / std::sqrt((double)B_after);
+        if(LoadTree(jentry) < 0)
+            break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formulaData.UpdateFormulaLeaves();
+        }
+        fChain->GetEntry(jentry);
+
+        if(id != 0)
+            continue;
+
+        if(formulaData.EvalInstance() > 0)
+        {
+            h_mass_bkg->Fill(D_M);
+        }
     }
 
-    return fom;
+    // Eseguiamo il fit con la funzione accecata
+    TF1 *f_bkg_fit = new TF1("f_bkg_fit", Pol2Blinded, xMin, xMax, 3);
+    f_bkg_fit->SetParameters(h_mass_bkg->GetEntries() / 50.0, 0.0, 0.0);
+    h_mass_bkg->Fit(f_bkg_fit, "R Q N");
+
+    // TRUCCO RISOLUTIVO: Copiamo i parametri su una funzione analitica CONTINUA
+    // per calcolare l'integrale reale senza il blocco "return 0.0"
+    TF1 f_proj("f_proj", "[0] + [1]*(x-1.85) + [2]*(x-1.85)*(x-1.85)", xMin, xMax);
+    f_proj.SetParameters(f_bkg_fit->GetParameters());
+
+    double binWidth = h_mass_bkg->GetBinWidth(1);
+    double integral = f_proj.Integral(blindMin, blindMax); // Integrazione corretta non nulla!
+
+    double B_est = integral / binWidth;
+
+    if(B_est < 0.0 || std::isnan(B_est))
+    {
+        B_est = 0.0;
+    }
+
+    // Cleanup memoria
+    delete h_mass_bkg;
+    delete f_bkg_fit;
+
+    // =========================================================================
+    // 3. CALCOLO DELLA PUNZI FOM
+    // =========================================================================
+    double punzi_fom = eff_sig / ((a_param / 2.0) + std::sqrt(B_est));
+
+    return punzi_fom;
 }
 
-// ================================================================================
-// ScanVariable: Calculates FOM, formats the TGraph and RETURNS it
-// ================================================================================
 TGraph *analysis::ScanVariable(const TString &baseline, const TString &varFormula, double start,
-    double stop, double step, double baseline_fom)
+    double stop, double step, double baseline_fom, double a_param)
 {
+    TString varName = varFormula;
+    int idx = varName.Index("X");
+    if(idx > 0)
+        varName.Remove(idx);
+    varName.ReplaceAll(">", "");
+    varName.ReplaceAll("<", "");
+    varName.ReplaceAll(" ", "");
+    varName.ReplaceAll("(", "");
+    varName.ReplaceAll(")", "");
+
     std::cout << "\n--- Scanning: " << varFormula.Data() << " ---" << std::endl;
 
     std::vector<double> x_vals;
@@ -3250,11 +3951,14 @@ TGraph *analysis::ScanVariable(const TString &baseline, const TString &varFormul
         double current_val = start + i * step;
 
         TString test_cond = varFormula;
-        test_cond.ReplaceAll("X", Form("%g", current_val));
+        test_cond.ReplaceAll("X",
+            Form("%e",
+                current_val)); // Usa notazione scientifica %e per gestire i metri (es. IP)
 
         TString full_cut = baseline + " && " + test_cond;
 
-        double fom = EvaluateFOM(full_cut);
+        // Calcoliamo la FOM con il nuovo metodo blindato
+        double fom = EvaluateFOM(full_cut, a_param);
 
         x_vals.push_back(current_val);
         y_foms.push_back(fom);
@@ -3266,142 +3970,28 @@ TGraph *analysis::ScanVariable(const TString &baseline, const TString &varFormul
         }
     }
 
-    TString varName = varFormula;
-    int idx = varName.Index("X");
-    if(idx > 0)
-        varName.Remove(idx);
-    varName.ReplaceAll(">", "");
-    varName.ReplaceAll("<", "");
-    varName.ReplaceAll(" ", "");
-    varName.ReplaceAll("(", "");
-    varName.ReplaceAll(")", "");
-
     std::cout << ">>> BEST CUT for " << varName.Data() << " is: " << best_val
               << " (FOM = " << best_fom << ")" << std::endl;
 
-    // Costruiamo e formattiamo il TGraph (rimane in memoria Heap)
     TGraph *g_fom = new TGraph(x_vals.size(), &x_vals[0], &y_foms[0]);
     g_fom->SetName(Form("g_%s", varName.Data()));
-    g_fom->SetTitle(Form("%s;Cut Value;FOM", varName.Data()));
+    g_fom->SetTitle(Form("%s;Cut Value;Punzi FOM", varName.Data()));
     g_fom->SetMarkerStyle(20);
     g_fom->SetMarkerSize(1.0);
     g_fom->SetMarkerColor(kBlue + 1);
     g_fom->SetLineColor(kBlue + 1);
     g_fom->SetLineWidth(2);
 
-    // Se savePlots è attivo, salviamo comunque il PDF singolo in background
-    if(savePlots)
-    {
-        TCanvas *c_temp = new TCanvas("c_temp", "", 800, 600);
-        c_temp->cd();
-        c_temp->SetGrid();
-        g_fom->Draw("APL");
-
-        TLine *l_base = new TLine(start, baseline_fom, stop, baseline_fom);
-        l_base->SetLineStyle(2);
-        l_base->SetLineColor(kGray + 2);
-        l_base->Draw("SAME");
-
-        c_temp->SaveAs(Form("./_fig/FOM_Scan_%s.pdf", varName.Data()));
-        delete c_temp; // Elimina solo la finestra temporanea, non il TGraph!
-    }
-
-    return g_fom; // Restituisce il grafico pronto per il pannello finale
+    return g_fom;
 }
 
-// ================================================================================
-// OptimizeCuts: Runs all scans and displays a 4x3 interactive Dashboard
-// ================================================================================
-void analysis::OptimizeCuts()
+void analysis::OptimizeParentCuts(double a_param)
 {
     std::cout << "\n=======================================================" << std::endl;
-    std::cout << "   STARTING AUTOMATED OFFLINE CUTS OPTIMIZATION" << std::endl;
+    std::cout << "   STARTING OPTIMIZATION FOR SELECTED 4 PARENT VARIABLES" << std::endl;
+    std::cout << Form("   PUNZI FOM SIGNIFICANCE TARGET: a = %.1f sigma", a_param) << std::endl;
     std::cout << "=======================================================" << std::endl;
 
-    TString baseline = "(h1_pt > 0.450 && h2_pt > 0.450) && (h1_p > 3.0 && h2_p > 3.0) && "
-                       "(h1_eta > 2.0 && h1_eta < 4.2) && (h2_eta > 2.0 && h2_eta < 4.2) && "
-                       "(h1_IP > 60e-6 && h2_IP > 60e-6) && "
-                       "h3_pt > 0.350 && h3_p > 3.0 && (h3_eta > 2.0 && h3_eta < 4.2) && "
-                       "h3_IP > 90e-6 && h3_MuonID == 1 && "
-                       "M0_pt > 0.9 && D_pt > 2.5 && D_time > 0.25e-12 && "
-                       "(D_M > 1.6 && D_M < 2.1)";
-
-    double baseline_fom = EvaluateFOM(baseline);
-    std::cout << "\n=======================================================" << std::endl;
-    std::cout << " BASELINE FOM (Table 2 cuts only) = " << baseline_fom << std::endl;
-    std::cout << "=======================================================" << std::endl;
-
-    // Vettore per raccogliere tutti i TGraph generati
-    std::vector<TGraph *> graphs;
-
-    // Eseguiamo gli 11 scansamenti e raccogliamo i grafici
-    graphs.push_back(ScanVariable(baseline, "h3_pt > X", 0.350, 1.5, 0.1, baseline_fom));
-    graphs.push_back(ScanVariable(baseline, "h3_p > X", 3.0, 15.0, 1.0, baseline_fom));
-    graphs.push_back(ScanVariable(baseline, "h3_IP > X", 90e-6, 300e-6, 30e-6, baseline_fom));
-
-    graphs.push_back(
-        ScanVariable(baseline, "(h1_pt > X && h2_pt > X)", 0.450, 1.5, 0.1, baseline_fom));
-    graphs.push_back(
-        ScanVariable(baseline, "(h1_p > X && h2_p > X)", 3.0, 15.0, 1.0, baseline_fom));
-    graphs.push_back(
-        ScanVariable(baseline, "(h1_IP > X && h2_IP > X)", 60e-6, 200e-6, 20e-6, baseline_fom));
-
-    graphs.push_back(ScanVariable(baseline, "M0_pt > X", 0.9, 3.0, 0.3, baseline_fom));
-
-    graphs.push_back(
-        ScanVariable(baseline, "D_time > X", 0.25e-12, 1.5e-12, 0.15e-12, baseline_fom));
-    graphs.push_back(ScanVariable(baseline, "D_pt > X", 2.5, 6.0, 0.5, baseline_fom));
-
-    graphs.push_back(ScanVariable(baseline, "D_IP < X", 100e-6, 10e-6, -10e-6, baseline_fom));
-    graphs.push_back(ScanVariable(baseline, "D_FDt > X", 0.0, 0.01, 0.001, baseline_fom));
-
-    // ==========================================================
-    // CREAZIONE DEL DASHBOARD RIASSUNTIVO (GRIGLIA 4x3)
-    // ==========================================================
-    // NOTA: Non cancelliamo questo Canvas a fine funzione, così rimarrà aperto!
-    TCanvas *c_summary
-        = new TCanvas("c_summary", "Offline Cuts Optimization Dashboard", 1600, 1000);
-    c_summary->Divide(4, 3); // 4 colonne, 3 righe (ospita fino a 12 grafici)
-
-    for(size_t i = 0; i < graphs.size(); ++i)
-    {
-        c_summary->cd(i + 1);
-        gPad->SetGrid();
-        gPad->SetBottomMargin(0.15);
-        gPad->SetLeftMargin(0.15);
-
-        // Disegna il grafico
-        graphs[i]->Draw("APL");
-
-        // Disegna la linea della FOM di riferimento (tratteggiata grigia)
-        double start = graphs[i]->GetX()[0];
-        double stop = graphs[i]->GetX()[graphs[i]->GetN() - 1];
-        TLine *l_base = new TLine(start, baseline_fom, stop, baseline_fom);
-        l_base->SetLineStyle(2);
-        l_base->SetLineColor(kGray + 2);
-        // l_base->SetLineWidth(2);
-        l_base->Draw("SAME");
-    }
-
-    c_summary->Update();
-
-    std::cout << "\n=======================================================" << std::endl;
-    std::cout << "   DASHBOARD GENERATED SUCCESSFULLY!" << std::endl;
-    std::cout << "   Look at the 'c_summary' window on your screen." << std::endl;
-    std::cout << "   The dashed line represents the baseline selection FOM." << std::endl;
-    std::cout << "=======================================================" << std::endl;
-}
-
-// ================================================================================
-// OptimizeAllParentCuts: Performs a scan on ALL 8 physical variables of parent D
-// ================================================================================
-void analysis::OptimizeAllParentCuts()
-{
-    std::cout << "\n=======================================================" << std::endl;
-    std::cout << "   RUNNING EXHAUSTIVE PARENT D VARIABLES OPTIMIZATION" << std::endl;
-    std::cout << "=======================================================" << std::endl;
-
-    // Baseline dei figli (Kaoni, Muone e Phi bloccati ai tagli minimi)
     TString baseline_daughters
         = "(h1_pt > 0.450 && h2_pt > 0.450) && (h1_p > 3.0 && h2_p > 3.0) && "
           "(h1_eta > 2.0 && h1_eta < 4.2) && (h2_eta > 2.0 && h2_eta < 4.2) && "
@@ -3410,65 +4000,53 @@ void analysis::OptimizeAllParentCuts()
           "h3_IP > 90e-6 && h3_MuonID == 1 && "
           "M0_pt > 0.9 && (D_M > 1.6 && D_M < 2.1)";
 
-    // Valutiamo la Punzi FOM al livello di trigger minimo (D_pt > 2.5, D_time > 0.25ps)
     TString trigger_tau = baseline_daughters + " && D_pt > 2.5 && D_time > 0.25e-12";
-    double baseline_fom = EvaluateFOM(trigger_tau);
+    double baseline_fom = EvaluateFOM(trigger_tau, a_param);
 
-    std::cout << "  Initial Trigger-Level FOM (No extra parent cuts) = " << baseline_fom
-              << std::endl;
+    std::cout << "  Initial Trigger-Level FOM (Baseline) = " << baseline_fom << std::endl;
     std::cout << "-------------------------------------------------------" << std::endl;
 
     std::vector<TGraph *> graphs;
 
-    // -- 1. D_pt (Momento trasverso parent) --
-    graphs.push_back(ScanVariable(trigger_tau, "D_pt > X", 2.5, 6.0, 0.5, baseline_fom));
+    // -- 1. D_p (Momento totale del padre) --
+    graphs.push_back(ScanVariable(trigger_tau, "D_p > X", 10.0, 50.0, 5.0, baseline_fom, a_param));
 
-    // -- 2. D_p (Momento totale parent) --
-    graphs.push_back(ScanVariable(trigger_tau, "D_p > X", 10.0, 50.0, 5.0, baseline_fom));
+    // -- 2. D_time (Tempo di volo proprio ct) --
+    graphs.push_back(ScanVariable(
+        trigger_tau, "D_time > X", 0.25e-12, 1.45e-12, 0.15e-12, baseline_fom, a_param));
 
-    // -- 3. D_eta (Pseudorapidità parent) --
-    graphs.push_back(ScanVariable(trigger_tau, "D_eta > X", 2.0, 3.2, 0.2, baseline_fom));
-
-    // -- 4. D_time (Tempo di decadimento proprio ct) --
+    // -- 3. D_IP (Impact Parameter del padre - scansione inversa con passo fine) --
+    // Partiamo da 150 micrometri (plateau) e scendiamo a 10 micrometri con passo fine di -10
+    // micrometri
     graphs.push_back(
-        ScanVariable(trigger_tau, "D_time > X", 0.25e-12, 1.5e-12, 0.15e-12, baseline_fom));
+        ScanVariable(trigger_tau, "D_IP < X", 150e-6, 10e-6, -10e-6, baseline_fom, a_param));
 
-    // -- 5. D_IP (Impact Parameter parent - si scansiona al ribasso < X) --
-    graphs.push_back(ScanVariable(trigger_tau, "D_IP < X", 100e-6, 10e-6, -10e-6, baseline_fom));
-
-    // -- 6. D_FD (Distanza di volo 3D totale - in metri, da 0 a 10 mm) --
-    graphs.push_back(ScanVariable(trigger_tau, "D_FD > X", 0.0, 10e-3, 1e-3, baseline_fom));
-
-    // -- 7. D_FDt (Distanza di volo trasversale xy - in metri, da 0 a 5 mm) --
-    graphs.push_back(ScanVariable(trigger_tau, "D_FDt > X", 0.0, 5e-3, 0.5e-3, baseline_fom));
-
-    // -- 8. D_FDz (Distanza di volo longitudinale z - in metri, da 0 a 15 mm) --
-    graphs.push_back(ScanVariable(trigger_tau, "D_FDz > X", 0.0, 15e-3, 1.5e-3, baseline_fom));
+    // -- 4. D_FD (Distanza di volo 3D) --
+    graphs.push_back(
+        ScanVariable(trigger_tau, "D_FD > X", 0.0, 0.01, 0.001, baseline_fom, a_param));
 
     // ==========================================================
-    // DISEGNO DEL DASHBOARD RIASSUNTIVO (GRIGLIA 4x2)
+    // DISEGNO DEL DASHBOARD RIASSUNTIVO (GRIGLIA 2x2)
     // ==========================================================
-    TCanvas *c_parent
-        = new TCanvas("c_parent", "Parent D Variables Optimization (All 8 Variables)", 1600, 800);
-    c_parent->Divide(4, 2); // 4 colonne, 2 righe
+    TCanvas *c_parent_opt
+        = new TCanvas("c_parent_opt", "Selected Parent Cuts Optimization", 1200, 1000);
+    c_parent_opt->Divide(2, 2);
 
-    TString titles[8] = { "p_{T}(D) Cut [GeV/#it{c}]", "p(D) Cut [GeV/#it{c}]", "#eta(D) Cut",
-        "#it{ct}(D) Cut [seconds]", "IP(D) Cut [meters]", "FD(D) Cut [meters]",
-        "FD_{T}(D) Cut [meters]", "FD_{z}(D) Cut [meters]" };
+    TString titles[4] = { "p(D) Cut [GeV/#it{c}]", "#it{ct}(D) Cut [seconds]", "IP(D) Cut [meters]",
+        "FD(D) Cut [meters]" };
 
     for(size_t i = 0; i < graphs.size(); ++i)
     {
-        c_parent->cd(i + 1);
+        c_parent_opt->cd(i + 1);
         gPad->SetGrid();
         gPad->SetBottomMargin(0.15);
         gPad->SetLeftMargin(0.15);
 
-        // Formattazione etichette assi per renderle fisicamente chiare
         graphs[i]->GetXaxis()->SetTitle(titles[i].Data());
         graphs[i]->GetYaxis()->SetTitle("Punzi FOM");
         graphs[i]->Draw("APL");
 
-        // Disegna la linea di riferimento della FOM iniziale (Trigger level)
+        // Disegna la linea della FOM di riferimento iniziale (Baseline del trigger)
         double start = graphs[i]->GetX()[0];
         double stop = graphs[i]->GetX()[graphs[i]->GetN() - 1];
         TLine *l_base = new TLine(start, baseline_fom, stop, baseline_fom);
@@ -3478,13 +4056,10 @@ void analysis::OptimizeAllParentCuts()
         l_base->Draw("SAME");
     }
 
-    c_parent->Update();
+    c_parent_opt->Update();
 
     std::cout << "\n=======================================================" << std::endl;
-    std::cout << "   PARENT VARIABLES OPTIMIZATION COMPLETED!" << std::endl;
-    std::cout << "   Visualise the 4x2 dashboard 'c_parent' on your screen." << std::endl;
-    std::cout << "   All 8 physical variables of the tau candidate have been evaluated."
-              << std::endl;
+    std::cout << "   OPTIMIZATION DASHBOARD GENERATED SUCCESSFULLY!" << std::endl;
     std::cout << "=======================================================\n" << std::endl;
 }
 
@@ -3574,8 +4149,8 @@ void analysis::StudyVertexCorrelations()
         hCorrBkg->GetYaxis()->SetBinLabel(i + 1, axisLabels[i]);
     }
 
-    // Algoritmo di Pearson corretto (Scale-Invariant e immune a variabili con ordini di grandezza
-    // minuscoli)
+    // Algoritmo di Pearson corretto (Scale-Invariant e immune a variabili con ordini di
+    // grandezza minuscoli)
     auto GetPearsonCorrelation
         = [](const std::vector<double> &x, const std::vector<double> &y) -> double
     {
@@ -3651,4 +4226,967 @@ void analysis::StudyVertexCorrelations()
     gStyle->SetTextFont(43);
 
     cout << "--> Analisi delle correlazioni completata con successo!" << endl;
+}
+
+void analysis::DrawBlindedBkgFit(const TString &cutString, double a_param)
+{
+    SetLBStyle(); // Applica il tuo stile di pubblicazione
+    gStyle->SetOptFit(0); // Evitiamo la stat box standard per non affollare il plot
+
+    Double_t xMin = 1.777 - 12 * 0.0058;
+    Double_t xMax = 1.777 + 12 * 0.0058;
+    Double_t blindMin = 1.777 - 3 * 0.0058; // 1.7596 GeV
+    Double_t blindMax = 1.777 + 3 * 0.0058; // 1.7944 GeV
+
+    // =========================================================================
+    // 1. CARICAMENTO DATI E RIEMPIMENTO ISTOGRAMMA
+    // =========================================================================
+    LoadDataset(0); // Dati reali
+    if(!fChain)
+    {
+        cerr << "[ERROR] fChain nullo!" << endl;
+        return;
+    }
+
+    TTreeFormula formulaData("cutData", cutString.Data(), fChain);
+    TH1D *h_mass_raw
+        = new TH1D("h_mass_raw", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 50, xMin, xMax);
+    h_mass_raw->SetDirectory(nullptr);
+    AddBinSizeOnYTitle(h_mass_raw, "GeV/#it{c}^{2}");
+
+    Int_t currentTreeNumber = -1;
+    for(Long64_t jentry = 0; jentry < fChain->GetEntriesFast(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formulaData.UpdateFormulaLeaves();
+        }
+        fChain->GetEntry(jentry);
+        if(id != 0)
+            continue;
+
+        if(formulaData.EvalInstance() > 0)
+        {
+            h_mass_raw->Fill(D_M);
+        }
+    }
+
+    // =========================================================================
+    // 2. ACCECAMENTO RIGOROSO DEI DATI DA DISEGNARE
+    // =========================================================================
+    TH1D *h_draw = (TH1D *)h_mass_raw->Clone("h_draw");
+    for(int i = 1; i <= h_draw->GetNbinsX(); ++i)
+    {
+        double center = h_draw->GetBinCenter(i);
+        if(center > blindMin && center < blindMax)
+        {
+            h_draw->SetBinContent(i, 0.0);
+            h_draw->SetBinError(i, 0.0); // Nessun punto dati mostrato nella finestra del segnale!
+        }
+    }
+
+    // =========================================================================
+    // 3. FIT SULLE SIDEBAND
+    // =========================================================================
+    TF1 *f_bkg_fit = new TF1("f_bkg_fit", Pol2Blinded, xMin, xMax, 3);
+    f_bkg_fit->SetParameters(h_draw->GetEntries() / 50.0, 0.0, 0.0);
+    h_draw->Fit(f_bkg_fit, "R Q N"); // Fit silenzioso
+
+    double p0 = f_bkg_fit->GetParameter(0);
+    double p1 = f_bkg_fit->GetParameter(1);
+    double p2 = f_bkg_fit->GetParameter(2);
+
+    // Calcoliamo B_est
+    double binWidth = h_draw->GetBinWidth(1);
+    double integral = f_bkg_fit->Integral(blindMin, blindMax);
+    double B_est = integral / binWidth;
+
+    // =========================================================================
+    // 4. CREAZIONE CURVE PER IL PLOT
+    // =========================================================================
+    // La funzione di fit originale (disegnata solida) mostrerà un vuoto nella regione blindata
+    f_bkg_fit->SetLineColor(kBlue + 1);
+    f_bkg_fit->SetLineWidth(3);
+    f_bkg_fit->SetNpx(1000);
+
+    // Creiamo una funzione continua che proietta il fit dentro la blinding region (linea
+    // tratteggiata)
+    TF1 *f_projection
+        = new TF1("f_projection", "[0] + [1]*(x-1.85) + [2]*(x-1.85)*(x-1.85)", xMin, xMax);
+    f_projection->SetParameters(p0, p1, p2);
+    f_projection->SetLineColor(kRed);
+    f_projection->SetLineStyle(2); // Tratteggiato
+    f_projection->SetLineWidth(3);
+    f_projection->SetNpx(1000);
+
+    // =========================================================================
+    // 5. DISEGNO SUL CANVAS
+    // =========================================================================
+    TCanvas *cDiag = new TCanvas("cDiag", "Diagnostic Sideband Fit", 800, 600);
+    cDiag->cd();
+    cDiag->SetGrid();
+
+    double max_y = h_draw->GetMaximum() * 1.3;
+    h_draw->SetMaximum(max_y);
+    h_draw->SetMinimum(0.0);
+    h_draw->Draw("E"); // Disegna i dati (esclusa la blinding region)
+
+    // Disegniamo la proiezione tratteggiata rossa (sotto) e il fit solido blu (sopra)
+    f_projection->Draw("SAME");
+    f_bkg_fit->Draw("SAME");
+
+    // Disegniamo le linee verticali di blinding
+    TLine *lineL = new TLine(blindMin, 0, blindMin, max_y);
+    TLine *lineH = new TLine(blindMax, 0, blindMax, max_y);
+    lineL->SetLineStyle(2);
+    lineL->SetLineColor(kGray + 2);
+    lineL->SetLineWidth(2);
+    lineH->SetLineStyle(2);
+    lineH->SetLineColor(kGray + 2);
+    lineH->SetLineWidth(2);
+    lineL->Draw("SAME");
+    lineH->Draw("SAME");
+
+    // Scatola informativa con i risultati
+    TPaveText *pt = new TPaveText(0.18, 0.65, 0.52, 0.88, "NDC");
+    pt->SetBorderSize(1);
+    pt->SetFillColor(kWhite);
+    pt->SetTextFont(42);
+    pt->SetTextAlign(12);
+    pt->AddText(Form("Fit Range: [%.2f, %.2f] GeV", xMin, xMax));
+    pt->AddText(Form("Blinded Window: [%.4f, %.4f] GeV", blindMin, blindMax));
+    pt->AddText(Form("#chi^{2} / ndf = %.1f / %d", f_bkg_fit->GetChisquare(), f_bkg_fit->GetNDF()));
+    pt->AddText(Form("Est. Background B = %.1f events", B_est));
+    pt->Draw("SAME");
+
+    TLegend *leg = new TLegend(0.55, 0.70, 0.88, 0.88);
+    leg->SetBorderSize(0);
+    leg->SetFillStyle(0);
+    leg->SetTextFont(42);
+    leg->AddEntry(h_draw, "Data (Sidebands Only)", "ep");
+    leg->AddEntry(f_bkg_fit, "Sideband Fit (Pol2)", "l");
+    leg->AddEntry(f_projection, "B Projection in Blind Region", "l");
+    leg->Draw("SAME");
+
+    cDiag->Update();
+
+    if(savePlots)
+    {
+        cDiag->SaveAs("./_fig/Diagnostic_SidebandFit.pdf");
+    }
+
+    // Cleanup
+    delete h_mass_raw;
+}
+
+TString analysis::GetCutString(bool useOptimized)
+{
+    if(useOptimized)
+    {
+        // INTERRUTTORE ACCESO: Baseline + tagli ottimizzati del padre D
+        return cut_baseline + " && D_IP <= 70e-6";
+    }
+    else
+    {
+        // INTERRUTTORE SPENTO: Solo i tagli di baseline originali (Tabella 2)
+        return cut_baseline;
+    }
+}
+
+// ----------- UNBLINDING -----------
+void analysis::UnblindResults()
+{
+    // Applica lo stile globale di Lorenzo
+    SetLBStyle();
+    gStyle->SetOptFit(0);
+
+    constexpr bool usePol1Bkg = false;
+    Double_t xMin = 1.6;
+    Double_t xMax = 2.10;
+
+    cout << "\n=======================================================" << endl;
+    cout << "          PERFORMING FINAL UNBLINDED ANALYSIS          " << endl;
+    cout << "=======================================================" << endl;
+
+    // =========================================================================
+    // STEP 1: CARICAMENTO DATI REALI SBLINDATI
+    // =========================================================================
+    LoadDataset(0);
+    if(!fChain)
+    {
+        cerr << "[ERROR] fChain is null!" << endl;
+        return;
+    }
+
+    g_data_events.clear();
+    auto h_mass
+        = new TH1D("h_mass_unblinded", ";Invariant Mass [GeV/#it{c}^{2}];Entries", 200, xMin, xMax);
+    h_mass->SetDirectory(nullptr);
+
+    TString cutString = GetCutString(USE_OPTIMIZED_CUTS);
+    TTreeFormula formula("cut", cutString.Data(), fChain);
+    Int_t currentTreeNumber = -1;
+
+    for(Long64_t jentry = 0; jentry < fChain->GetEntries(); jentry++)
+    {
+        if(LoadTree(jentry) < 0)
+            break;
+        if(fChain->GetTreeNumber() != currentTreeNumber)
+        {
+            currentTreeNumber = fChain->GetTreeNumber();
+            formula.UpdateFormulaLeaves();
+        }
+        fChain->GetEntry(jentry);
+        if(id != 0)
+            continue;
+
+        if(formula.EvalInstance() > 0)
+        {
+            if(D_M >= xMin && D_M <= xMax)
+            {
+                g_data_events.push_back(D_M);
+                h_mass->Fill(D_M);
+            }
+        }
+    }
+    g_data_hist = h_mass;
+    double nEntries = h_mass->GetEntries();
+    double binWidth = h_mass->GetBinWidth(1);
+
+    // Caricamento dei fit ausiliari MC per vincolare le forme dei background fisici
+    LoadDataset(1);
+    AuxFitResult res_sig = FitTemplateMass(44);
+    AuxFitResult res_p1 = FitTemplateMass(34);
+    AuxFitResult res_p2 = FitTemplateMass(41);
+    AuxFitResult res_arg = FitTemplateMass(42);
+    LoadDataset(0); // Ritorno ai dati reali
+
+    g_pdf_unbinned = new FullUnbinnedPDF(xMin, xMax, res_sig, res_p1, res_p2, res_arg, usePol1Bkg);
+
+    // =========================================================================
+    // STEP 2: FIT MASSIMO SVINCOLATO (H1 - SEGNALE LIBERO)
+    // =========================================================================
+    ROOT::Math::Minimizer *minH1 = ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+    minH1->SetMaxFunctionCalls(100000);
+    minH1->SetTolerance(0.01);
+    minH1->SetPrintLevel(0);
+
+    int nPars = USE_EXTENDED ? 21 : 20;
+    ROOT::Math::Functor fNLL(
+        USE_EXTENDED ? &BinnedExtended2NLL : (USE_UNBINNED ? &Unbinned2NLL : &Binned2NLL), nPars);
+    minH1->SetFunction(fNLL);
+
+    minH1->SetVariable(0, "f_s", 0.002, 0.0005);
+    minH1->SetVariable(1, "f_1", 0.021, 0.001);
+    minH1->SetVariable(2, "f_2", 0.043, 0.001);
+    minH1->SetVariable(3, "f_3", 0.656, 0.001);
+    minH1->SetVariable(4, "slope", -0.93, 0.01);
+
+    // Impostazione dei parametri di forma congelati ai fit ausiliari MC
+    minH1->SetFixedVariable(5, "sig_mean", res_sig.params[1]);
+    minH1->SetFixedVariable(6, "sig_sigma1", res_sig.params[2]);
+    minH1->SetFixedVariable(7, "sig_sigma2", res_sig.params[3]);
+    minH1->SetFixedVariable(8, "sig_frac1", res_sig.params[4]);
+
+    minH1->SetFixedVariable(9, "p1_mean", res_p1.params[1]);
+    minH1->SetFixedVariable(10, "p1_sigma1", res_p1.params[2]);
+    minH1->SetFixedVariable(11, "p1_sigma2", res_p1.params[3]);
+    minH1->SetFixedVariable(12, "p1_frac1", res_p1.params[4]);
+
+    minH1->SetFixedVariable(13, "p2_mean", res_p2.params[1]);
+    minH1->SetFixedVariable(14, "p2_sigma1", res_p2.params[2]);
+    minH1->SetFixedVariable(15, "p2_sigma2", res_p2.params[3]);
+    minH1->SetFixedVariable(16, "p2_frac1", res_p2.params[4]);
+
+    minH1->SetFixedVariable(17, "argus_m0", res_arg.params[1]);
+    minH1->SetFixedVariable(18, "argus_c", res_arg.params[2]);
+    minH1->SetFixedVariable(19, "argus_p", res_arg.params[3]);
+
+    if(USE_EXTENDED)
+    {
+        minH1->SetVariable(20, "N_tot", nEntries, std::sqrt(nEntries));
+    }
+
+    minH1->Minimize();
+    minH1->Hesse();
+
+    double nll_H1 = minH1->MinValue();
+    const double *xs = minH1->X();
+    const double *errs = minH1->Errors();
+
+    double fit_fs = xs[0];
+    double fit_fs_err = errs[0];
+    double fit_f3 = xs[3];
+    double fit_f3_err = errs[3];
+    double cov_fs_f3 = minH1->CovMatrix(0, 3);
+
+    // =========================================================================
+    // STEP 3: FIT VINCOLATO (H0 - IPOTESI NULLA f_s = 0)
+    // =========================================================================
+    ROOT::Math::Minimizer *minH0 = ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+    minH0->SetMaxFunctionCalls(100000);
+    minH0->SetTolerance(0.01);
+    minH0->SetPrintLevel(0);
+    minH0->SetFunction(fNLL);
+
+    minH0->SetFixedVariable(0, "f_s", 0.0);
+
+    for(unsigned int p = 1; p < minH1->NDim(); ++p)
+    {
+        minH0->SetVariable(p, minH1->VariableName(p), xs[p], errs[p]);
+        if(minH1->IsFixedVariable(p))
+        {
+            minH0->FixVariable(p);
+        }
+    }
+
+    minH0->Minimize();
+    double nll_H0 = minH0->MinValue();
+
+    // =========================================================================
+    // STEP 4: CALCOLO DEI PUNTI DI STIMA E DELLE INCERTEZZE
+    // =========================================================================
+    double r_eff = GetMCEfficiencyRatio(USE_OPTIMIZED_CUTS);
+    const double br_taunu_nom = 5.39e-2;
+    const double br_taunu_err = 0.09e-2;
+    const double br_phimunu_nom = 2.24e-2;
+    const double br_phimunu_err = 0.11e-2;
+    double k_factor_nom = r_eff * (br_phimunu_nom / br_taunu_nom);
+
+    double fit_Y = fit_fs / ((1.0 - fit_fs) * fit_f3);
+
+    // Propagazione degli errori su Y (Delta Method con covarianza)
+    double dF_dfs = 1.0 / ((1.0 - fit_fs) * (1.0 - fit_fs) * fit_f3);
+    double dF_df3 = -fit_fs / ((1.0 - fit_fs) * fit_f3 * fit_f3);
+    double var_Y = (dF_dfs * dF_dfs * fit_fs_err * fit_fs_err)
+        + (dF_df3 * dF_df3 * fit_f3_err * fit_f3_err) + (2.0 * dF_dfs * dF_df3 * cov_fs_f3);
+    double fit_Y_err = (var_Y > 0.0) ? std::sqrt(var_Y) : 0.0;
+
+    double fit_BR = fit_Y * k_factor_nom;
+    double fit_Rtau = fit_Y * r_eff;
+
+    // Propagazione degli errori sistematici esterni per il BR
+    double rel_err_k2 = (br_phimunu_err / br_phimunu_nom) * (br_phimunu_err / br_phimunu_nom)
+        + (br_taunu_err / br_taunu_nom) * (br_taunu_err / br_taunu_nom);
+    double err_k = k_factor_nom * std::sqrt(rel_err_k2);
+    double fit_BR_err
+        = std::sqrt((k_factor_nom * k_factor_nom * var_Y) + (fit_Y * fit_Y * err_k * err_k));
+    double fit_Rtau_err = fit_Rtau * (fit_Y_err / fit_Y);
+
+    // =========================================================================
+    // STEP 5: CALCOLO DEL p-value E SIGNIFICATIVITÀ CON FATTORE 1/2
+    // =========================================================================
+    double delta_nll = nll_H0 - nll_H1;
+    if(delta_nll < 0.0)
+        delta_nll = 0.0;
+
+    double p_value = 1.0;
+    double significance = 0.0;
+
+    if(fit_fs > 0.0)
+    {
+        // p-value ad una coda con barriera fisica (Teorema di Chernoff)
+        p_value = 0.5 * TMath::Prob(delta_nll, 1);
+        significance = TMath::NormQuantile(1.0 - p_value);
+    }
+    else
+    {
+        p_value = 0.5;
+        significance = 0.0;
+    }
+
+    // =========================================================================
+    // STEP 6: ESTRAZIONE DEI LIMITI DA ENTRAMBE LE BANDE (CONTINUE E DISCRETE)
+    // =========================================================================
+    auto getFCIntervalsAll
+        = [](const TString &suffix, double observed_val, double &low_cont, double &up_cont,
+              double &low_disc, double &up_disc) -> std::pair<bool, bool>
+    {
+        TString fName = Form("./_root/FC_Belt_Output_%s.root", suffix.Data());
+        TFile *f = TFile::Open(fName, "READ");
+        if(!f || f->IsZombie())
+        {
+            return { false, false };
+        }
+
+        bool ok_cont = false;
+        TGraph *g_up_c = (TGraph *)f->Get("g_up_interpolated");
+        TGraph *g_low_c = (TGraph *)f->Get("g_low_interpolated");
+        if(g_up_c && g_low_c)
+        {
+            up_cont = g_up_c->Eval(observed_val);
+            low_cont = g_low_c->Eval(observed_val);
+            if(low_cont < 0.0 || std::isnan(low_cont))
+                low_cont = 0.0;
+            if(up_cont < 0.0 || std::isnan(up_cont))
+                up_cont = 0.0;
+            ok_cont = true;
+        }
+
+        bool ok_disc = false;
+        TGraph *g_up_d = (TGraph *)f->Get("g_up_discrete_interpolated");
+        TGraph *g_low_d = (TGraph *)f->Get("g_low_discrete_interpolated");
+        if(g_up_d && g_low_d)
+        {
+            up_disc = g_up_d->Eval(observed_val);
+            low_disc = g_low_d->Eval(observed_val);
+            if(low_disc < 0.0 || std::isnan(low_disc))
+                low_disc = 0.0;
+            if(up_disc < 0.0 || std::isnan(up_disc))
+                up_disc = 0.0;
+            ok_disc = true;
+        }
+
+        f->Close();
+        return { ok_cont, ok_disc };
+    };
+
+    double fs_low_c = 0.0, fs_up_c = 0.0, fs_low_d = 0.0, fs_up_d = 0.0;
+    double BR_low_c = 0.0, BR_up_c = 0.0, BR_low_d = 0.0, BR_up_d = 0.0;
+    double Rtau_low_c = 0.0, Rtau_up_c = 0.0, Rtau_low_d = 0.0, Rtau_up_d = 0.0;
+
+    auto res_fs = getFCIntervalsAll("fs", fit_fs, fs_low_c, fs_up_c, fs_low_d, fs_up_d);
+    auto res_BR = getFCIntervalsAll("BR", fit_BR, BR_low_c, BR_up_c, BR_low_d, BR_up_d);
+    auto res_Rtau
+        = getFCIntervalsAll("Rtau", fit_Rtau, Rtau_low_c, Rtau_up_c, Rtau_low_d, Rtau_up_d);
+
+    // =========================================================================
+    // STEP 7: LOG OUTPUT DETTAGLIATO (CON FORMATTAZIONE PDG ALLA SCALA 10^-4)
+    // =========================================================================
+    cout << "\n======================================================================" << endl;
+    cout << "                    FINAL UNBLINDED PHYSICS RESULTS                    " << endl;
+    cout << "======================================================================" << endl;
+    cout << "  Fitted Signal Fraction (f_s) : " << FormatPDG(fit_fs, fit_fs_err) << endl;
+    cout << "  Fitted Normalization (f_3)   : " << FormatPDG(fit_f3, fit_f3_err) << endl;
+    cout << Form("  Profile Likelihood Ratio t_0 : %.4f (NLL_H0 = %.2f, NLL_H1 = %.2f)", delta_nll,
+        nll_H0, nll_H1)
+         << endl;
+    cout << Form(
+        "  Corrected One-Sided p-value  : %e (Chernoff Mixture 1/2 delta + 1/2 chi2)", p_value)
+         << endl;
+    cout << Form("  Signal Significance (Z)     : %.2f standard deviations (sigma)", significance)
+         << endl;
+    cout << "----------------------------------------------------------------------" << endl;
+
+    // Risultati Branching Ratio formattati PDG alla scala naturale di 10^-4
+    cout << "  8. RESULTS FOR B(tau+ -> phi mu+):" << endl;
+    cout << "     - Point Estimate:  " << FormatPDG(fit_BR * 1e4, fit_BR_err * 1e4, "10^{-4}")
+         << endl;
+
+    if(res_BR.first)
+    {
+        cout << "     [Continuous Belt (Resolution Extrap.) 90% CL]:" << endl;
+        if(BR_low_c <= 0.0)
+        {
+            cout << Form("       - Upper Limit: B < %.2f x 10^-4", BR_up_c * 1e4) << endl;
+        }
+        else
+        {
+            cout << Form(
+                "       - Two-Sided Interval: [%.2f, %.2f] x 10^-4", BR_low_c * 1e4, BR_up_c * 1e4)
+                 << endl;
+        }
+    }
+    if(res_BR.second)
+    {
+        cout << "     [Discrete Smoothed Belt (Toy MC + Spline) 90% CL]:" << endl;
+        if(BR_low_d <= 0.0)
+        {
+            cout << Form("       - Upper Limit: B < %.2f x 10^-4", BR_up_d * 1e4) << endl;
+        }
+        else
+        {
+            cout << Form(
+                "       - Two-Sided Interval: [%.2f, %.2f] x 10^-4", BR_low_d * 1e4, BR_up_d * 1e4)
+                 << endl;
+        }
+    }
+    cout << "----------------------------------------------------------------------" << endl;
+
+    // Risultati R_tau formattati PDG riscalando a 10^-4
+    cout << "  9. RESULTS FOR R_tau:" << endl;
+    cout << "     - Point Estimate:  " << FormatPDG(fit_Rtau * 1e4, fit_Rtau_err * 1e4, "10^{-4}")
+         << endl;
+
+    if(res_Rtau.first)
+    {
+        cout << "     [Continuous Belt (Resolution Extrap.) 90% CL]:" << endl;
+        if(Rtau_low_c <= 0.0)
+        {
+            cout << Form("       - Upper Limit: R_tau < %.2f x 10^-4", Rtau_up_c * 1e4) << endl;
+        }
+        else
+        {
+            cout << Form("       - Two-Sided Interval: [%.2f, %.2f] x 10^-4", Rtau_low_c * 1e4,
+                Rtau_up_c * 1e4)
+                 << endl;
+        }
+    }
+    if(res_Rtau.second)
+    {
+        cout << "     [Discrete Smoothed Belt (Toy MC + Spline) 90% CL]:" << endl;
+        if(Rtau_low_d <= 0.0)
+        {
+            cout << Form("       - Upper Limit: R_tau < %.2f x 10^-4", Rtau_up_d * 1e4) << endl;
+        }
+        else
+        {
+            cout << Form("       - Two-Sided Interval: [%.2f, %.2f] x 10^-4", Rtau_low_d * 1e4,
+                Rtau_up_d * 1e4)
+                 << endl;
+        }
+    }
+    cout << "======================================================================" << endl;
+
+    // =========================================================================
+    // STEP 8: PREPARAZIONE DELLE COPIE PROFONDE PER LE LAMBDA (RISOLVE IL CRASH)
+    // =========================================================================
+    FullUnbinnedPDF pdf_val = *g_pdf_unbinned;
+    std::vector<double> xs_val(xs, xs + minH1->NDim());
+
+    // =========================================================================
+    // STEP 9: DISEGNO DEL PLOT SBLINDATO (STILE LORENZO)
+    // =========================================================================
+    // Nota: creiamo la canvas senza argomenti di dimensione per ereditare l'800x600 di lbStyle
+    TCanvas *c_unblind = new TCanvas("c_unblind", "Unblinded Final Maximum Likelihood Fit");
+    double splitPoint = 0.30;
+
+    // Pad Superiore (Fit di Massa)
+    TPad *pad1 = new TPad("pad1", "Main Fit Pad", 0.0, splitPoint, 1.0, 1.0);
+    pad1->SetLeftMargin(0.16);
+    pad1->SetRightMargin(0.08);
+    pad1->SetTopMargin(0.08);
+    pad1->SetBottomMargin(0.02); // Congiunge perfettamente con il pad inferiore
+    pad1->Draw();
+    pad1->cd();
+
+    h_mass->GetYaxis()->SetTitle("Entries");
+    AddBinSizeOnYTitle(h_mass, "GeV/#it{c}^{2}", "Entries");
+
+    // Rimuove etichette asse X dal pad principale
+    h_mass->GetXaxis()->SetLabelSize(0);
+    h_mass->GetXaxis()->SetTitleSize(0);
+    h_mass->SetMinimum(0.0);
+    h_mass->SetMarkerStyle(20);
+    h_mass->SetMarkerSize(0.9);
+    h_mass->Draw("E");
+
+    // Calcolo del fattore di scala per la normalizzazione
+    double nTotFit = USE_EXTENDED ? xs_val[20] : nEntries;
+
+    // Lambda che catturano per VALORE (Copia profonda sicura)
+    auto scale_pdf_lambda = [binWidth, xs_val, nTotFit, pdf_val](double *x, double *par)
+    {
+        double xx = x[0];
+        return nTotFit * binWidth * pdf_val(&xx, xs_val.data());
+    };
+
+    auto scale_sig_lambda = [binWidth, xs_val, nTotFit, pdf_val](double *x, double *par)
+    {
+        double xx = x[0];
+        double p_sig = pdf_val.Eval2G(xx, xs_val[5], xs_val[6], xs_val[7], xs_val[8]);
+        return nTotFit * binWidth * (xs_val[0] * p_sig);
+    };
+
+    auto scale_comb_lambda
+        = [binWidth, xs_val, nTotFit, pdf_val, usePol1Bkg](double *x, double *par)
+    {
+        double xx = x[0];
+        double p_4 = usePol1Bkg ? pdf_val.EvalPol1(xx, xs_val[4]) : pdf_val.EvalExpo(xx, xs_val[4]);
+        double frac_comb = (1.0 - xs_val[0]) * (1.0 - xs_val[1] - xs_val[2] - xs_val[3]);
+        return nTotFit * binWidth * (frac_comb * p_4);
+    };
+
+    auto scale_p1_lambda = [binWidth, xs_val, nTotFit, pdf_val](double *x, double *par)
+    {
+        double xx = x[0];
+        double p_1 = pdf_val.Eval2G(xx, xs_val[9], xs_val[10], xs_val[11], xs_val[12]);
+        return nTotFit * binWidth * ((1.0 - xs_val[0]) * xs_val[1] * p_1);
+    };
+
+    auto scale_p2_lambda = [binWidth, xs_val, nTotFit, pdf_val](double *x, double *par)
+    {
+        double xx = x[0];
+        double p_2 = pdf_val.Eval2G(xx, xs_val[13], xs_val[14], xs_val[15], xs_val[16]);
+        return nTotFit * binWidth * ((1.0 - xs_val[0]) * xs_val[2] * p_2);
+    };
+
+    auto scale_argus_lambda = [binWidth, xs_val, nTotFit, pdf_val](double *x, double *par)
+    {
+        double xx = x[0];
+        double p_3 = pdf_val.EvalArgus(xx, xs_val[17], xs_val[18], xs_val[19]);
+        return nTotFit * binWidth * ((1.0 - xs_val[0]) * xs_val[3] * p_3);
+    };
+
+    TF1 *f_draw = new TF1("f_draw", scale_pdf_lambda, xMin, xMax, 0);
+    f_draw->SetNpx(10000);
+    f_draw->SetLineColor(kBlue);
+    f_draw->SetLineWidth(3);
+
+    TF1 *f_sig = new TF1("f_sig", scale_sig_lambda, xMin, xMax, 0);
+    f_sig->SetNpx(10000);
+    f_sig->SetLineColor(kRed);
+    f_sig->SetLineStyle(2);
+    f_sig->SetLineWidth(2);
+
+    TF1 *f_comb = new TF1("f_comb", scale_comb_lambda, xMin, xMax, 0);
+    f_comb->SetNpx(10000);
+    f_comb->SetLineColor(kGray + 2);
+    f_comb->SetLineStyle(3);
+    f_comb->SetLineWidth(2);
+
+    TF1 *f_p1 = new TF1("f_p1", scale_p1_lambda, xMin, xMax, 0);
+    f_p1->SetNpx(10000);
+    f_p1->SetLineColor(kOrange + 1);
+    f_p1->SetLineStyle(7);
+    f_p1->SetLineWidth(2);
+
+    TF1 *f_p2 = new TF1("f_p2", scale_p2_lambda, xMin, xMax, 0);
+    f_p2->SetNpx(10000);
+    f_p2->SetLineColor(kMagenta);
+    f_p2->SetLineStyle(7);
+    f_p2->SetLineWidth(2);
+
+    TF1 *f_arg = new TF1("f_arg", scale_argus_lambda, xMin, xMax, 0);
+    f_arg->SetNpx(10000);
+    f_arg->SetLineColor(kCyan + 1);
+    f_arg->SetLineStyle(5);
+    f_arg->SetLineWidth(2);
+
+    f_draw->Draw("SAME");
+    f_sig->Draw("SAME");
+    f_comb->Draw("SAME");
+    f_p1->Draw("SAME");
+    f_p2->Draw("SAME");
+    f_arg->Draw("SAME");
+
+    // =========================================================================
+    // CALCOLO DEL CHI2/NDOF SUI DATI SBLINDATI (USATO PER IL PAVETEXT)
+    // =========================================================================
+    double chi2 = 0.0;
+    int nBinsUsed = 0;
+    for(int i = 1; i <= h_mass->GetNbinsX(); i++)
+    {
+        double x = h_mass->GetBinCenter(i);
+        if(x < xMin || x > xMax)
+            continue;
+
+        double obs = h_mass->GetBinContent(i);
+        double err = h_mass->GetBinError(i);
+        if(err > 0)
+        {
+            double val = f_draw->Eval(h_mass->GetBinCenter(i));
+            chi2 += (obs - val) * (obs - val) / (err * err);
+            nBinsUsed++;
+        }
+    }
+    int ndf = nBinsUsed - minH1->NFree();
+
+    // Legenda trasparente con font assoluto 43 a 20 pixel (senza override manuali non necessari)
+    TLegend *leg = new TLegend(0.48, 0.40, 0.92, 0.88);
+    leg->SetBorderSize(0);
+    leg->SetFillStyle(0);
+    leg->SetTextFont(43);
+    leg->SetTextSize(20);
+    leg->AddEntry(h_mass, "Data (Unblinded)", "ep");
+    leg->AddEntry(f_draw, "Total Fit", "l");
+    leg->AddEntry(f_sig, "Signal (#tau^{+}#rightarrow#phi#mu^{+})", "l");
+    leg->AddEntry(f_p1, "D^{+}#rightarrow#phi#pi^{+} Bkg", "l");
+    leg->AddEntry(f_p2, "D_{s}^{+}#rightarrow#phi#pi^{+} Bkg", "l");
+    leg->AddEntry(f_arg, "D_{s}^{+}#rightarrow#phi#mu^{+}#nu_{#mu} (Argus) Bkg", "l");
+    leg->AddEntry(f_comb, "Combinatorial Bkg", "l");
+    leg->Draw("SAME");
+
+    // Box informativa con chi2/ndf e il BR fittato (Stile pulito, senza loghi o bordi)
+    TPaveText *paveStats = new TPaveText(0.18, 0.68, 0.46, 0.86, "NDC");
+    paveStats->SetBorderSize(0);
+    paveStats->SetFillStyle(0);
+    paveStats->SetTextFont(43);
+    paveStats->SetTextSize(22);
+    paveStats->SetTextAlign(12);
+    paveStats->AddText(Form("#chi^{2} / ndf = %.1f / %d", chi2, ndf));
+    paveStats->AddText("#font[12]{B}(#tau^{+}#rightarrow#phi#mu^{+}) = "
+        + FormatPDG(fit_BR * 1e4, fit_BR_err * 1e4, "10^{-4}"));
+    paveStats->Draw();
+
+    // Pad Inferiore (Residui / Pulls)
+    c_unblind->cd();
+    TPad *pad2 = new TPad("pad2", "Pull Pad", 0.0, 0.0, 1.0, splitPoint);
+    pad2->SetLeftMargin(0.16);
+    pad2->SetRightMargin(0.08);
+    pad2->SetTopMargin(0.02);
+    pad2->SetBottomMargin(0.38); // Margine per il titolo asse X
+    pad2->SetGridy();
+    pad2->Draw();
+    pad2->cd();
+
+    TH1D *hPull = (TH1D *)h_mass->Clone("hPull_unblinded");
+    hPull->Reset();
+    hPull->SetStats(0);
+
+    // Configurazione degli assi per il pad dei residui (Default di lbStyle ereditati)
+    hPull->GetYaxis()->SetTitle("Pull");
+    hPull->GetYaxis()->SetRangeUser(-5.0, 5.0);
+
+    hPull->GetXaxis()->SetTitle("M(D_{s}^{+}) [GeV/#it{c}^{2}]");
+
+    for(int i = 1; i <= h_mass->GetNbinsX(); i++)
+    {
+        double obs = h_mass->GetBinContent(i);
+        double err = h_mass->GetBinError(i);
+        if(err > 0)
+        {
+            double val = f_draw->Eval(h_mass->GetBinCenter(i));
+            hPull->SetBinContent(i, (obs - val) / err);
+        }
+        else
+        {
+            hPull->SetBinContent(i, -999);
+        }
+    }
+    hPull->SetMarkerStyle(20);
+    hPull->SetMarkerSize(0.8);
+    hPull->SetLineColor(kBlack);
+    hPull->Draw("P");
+
+    TLine *line0 = new TLine(xMin, 0.0, xMax, 0.0);
+    line0->SetLineColor(kRed);
+    line0->SetLineWidth(2);
+    line0->Draw();
+
+    c_unblind->Update();
+
+    // Salvataggio del plot dei residui
+    if(savePlots)
+    {
+        SavePlot(c_unblind, "./_fig/Unblinded_FinalFit_Pulls", false);
+        c_unblind->SaveAs("./_root/Unblinded_FinalFit_Pulls.root");
+    }
+
+    // =========================================================================
+    // STEP 10: DISEGNO DELLA BANDA FELDMAN-COUSINS CONTINUA CON MISURA OVERLAY
+    // =========================================================================
+    TFile *fFC = TFile::Open("./_root/FC_Belt_Output_BR.root", "READ");
+    if(fFC && !fFC->IsZombie())
+    {
+        // Carichiamo le curve continue anziché quelle discrete
+        TGraph *g_belt = (TGraph *)fFC->Get("g_belt_interpolated");
+        TGraph *g_up = (TGraph *)fFC->Get("g_up_interpolated");
+        TGraph *g_low = (TGraph *)fFC->Get("g_low_interpolated");
+
+        if(g_belt && g_up && g_low)
+        {
+            // Canvas quadrata (800x800) per preservare l'aspect ratio diagonale (Y = X)
+            TCanvas *cFC_meas
+                = new TCanvas("cFC_meas", "Feldman-Cousins Unblinded Measurement", 800, 800);
+            cFC_meas->cd();
+            cFC_meas->SetGrid();
+
+            // Configurazione dei margini per garantire spazio adeguato al testo degli assi
+            cFC_meas->SetLeftMargin(0.16);
+            cFC_meas->SetRightMargin(0.08);
+            cFC_meas->SetTopMargin(0.08);
+            cFC_meas->SetBottomMargin(0.14);
+
+            // Clonazione e applicazione del fattore di scala fisico noto (10^-4)
+            TGraph *g_belt_scaled = (TGraph *)g_belt->Clone("g_belt_scaled_unblind");
+            TGraph *g_up_scaled = (TGraph *)g_up->Clone("g_up_scaled_unblind");
+            TGraph *g_low_scaled = (TGraph *)g_low->Clone("g_low_scaled_unblind");
+
+            const double target_scale = 1e4;
+
+            for(int i = 0; i < g_belt_scaled->GetN(); ++i)
+            {
+                double tx, ty;
+                g_belt_scaled->GetPoint(i, tx, ty);
+                g_belt_scaled->SetPoint(i, tx * target_scale, ty * target_scale);
+            }
+            for(int i = 0; i < g_up_scaled->GetN(); ++i)
+            {
+                double tx, ty;
+                g_up_scaled->GetPoint(i, tx, ty);
+                g_up_scaled->SetPoint(i, tx * target_scale, ty * target_scale);
+            }
+            for(int i = 0; i < g_low_scaled->GetN(); ++i)
+            {
+                double tx, ty;
+                g_low_scaled->GetPoint(i, tx, ty);
+                g_low_scaled->SetPoint(i, tx * target_scale, ty * target_scale);
+            }
+
+            g_belt_scaled->SetFillColorAlpha(kGreen - 9, 0.45);
+            g_belt_scaled->SetLineWidth(0);
+
+            g_up_scaled->SetLineColor(kGreen + 2);
+            g_up_scaled->SetLineWidth(3);
+
+            g_low_scaled->SetLineColor(kGreen + 2);
+            g_low_scaled->SetLineWidth(3);
+
+            // Determinazione deterministica dei limiti basata sul valore massimo (allineato
+            // all'originale)
+            double max_x = -1e9;
+            double max_y = -1e9;
+            for(int i = 0; i < g_up_scaled->GetN(); ++i)
+            {
+                double tx, ty;
+                g_up_scaled->GetPoint(i, tx, ty);
+                if(tx > max_x)
+                    max_x = tx;
+                if(ty > max_y)
+                    max_y = ty;
+            }
+
+            double plot_x_min = -0.05 * max_x;
+            double plot_x_max = 1.10 * max_x;
+            double plot_y_min = 0.0;
+            double plot_y_max = 1.10 * max_y;
+
+            // HARD RESET DI gStyle: Forza l'annullamento di qualsiasi offset estremo o dimensione
+            // zero ereditata
+            gStyle->SetLabelFont(42, "XYZ");
+            gStyle->SetLabelSize(0.04, "XYZ");
+            gStyle->SetLabelColor(kBlack, "XYZ");
+            gStyle->SetLabelOffset(
+                0.007, "XYZ"); // Ripristina l'offset dei numeri a valori visibili standard
+
+            gStyle->SetTitleFont(42, "XYZ");
+            gStyle->SetTitleSize(0.045, "XYZ");
+            gStyle->SetTitleColor(kBlack, "XYZ");
+            gStyle->SetTitleOffset(1.2, "X");
+            gStyle->SetTitleOffset(1.5, "Y");
+
+            gStyle->SetAxisColor(kBlack, "XYZ");
+            gStyle->SetTickLength(0.03, "XYZ");
+
+            // Creazione cornice TH2F (Semplificato il TLatex usando #it{B} per evitare conflitti di
+            // font)
+            TH2F *hFrameFC = new TH2F("hFrameFC_unblind",
+                ";Measured #hat{#it{B}}(#tau^{+}#rightarrow#phi#mu^{+}) [10^{-4}];True "
+                "#it{B}(#tau^{+}#rightarrow#phi#mu^{+}) [10^{-4}]",
+                100, plot_x_min, plot_x_max, 100, plot_y_min, plot_y_max);
+            hFrameFC->SetStats(0);
+
+            // Sovrascrittura locale di sicurezza su hFrameFC per ignorare lo stile globale
+            hFrameFC->GetXaxis()->SetLabelFont(42);
+            hFrameFC->GetXaxis()->SetLabelSize(0.04);
+            hFrameFC->GetXaxis()->SetLabelColor(kBlack);
+            hFrameFC->GetXaxis()->SetLabelOffset(0.007); // Riporta i numeri vicino all'asse
+            hFrameFC->GetXaxis()->SetTitleFont(42);
+            hFrameFC->GetXaxis()->SetTitleSize(0.045);
+            hFrameFC->GetXaxis()->SetTitleColor(kBlack);
+            hFrameFC->GetXaxis()->SetTitleOffset(1.2);
+            hFrameFC->GetXaxis()->SetAxisColor(kBlack);
+
+            hFrameFC->GetYaxis()->SetLabelFont(42);
+            hFrameFC->GetYaxis()->SetLabelSize(0.04);
+            hFrameFC->GetYaxis()->SetLabelColor(kBlack);
+            hFrameFC->GetYaxis()->SetLabelOffset(0.007);
+            hFrameFC->GetYaxis()->SetTitleFont(42);
+            hFrameFC->GetYaxis()->SetTitleSize(0.045);
+            hFrameFC->GetYaxis()->SetTitleColor(kBlack);
+            hFrameFC->GetYaxis()->SetTitleOffset(1.5);
+            hFrameFC->GetYaxis()->SetAxisColor(kBlack);
+
+            hFrameFC->Draw();
+
+            // Disegno elementi della banda continua riscalati
+            g_belt_scaled->Draw("F SAME");
+            g_up_scaled->Draw("L SAME");
+            g_low_scaled->Draw("L SAME");
+
+            // Diagonale di misura ideale (Y = X)
+            TLine *diag = new TLine(0.0, 0.0, plot_y_max, plot_y_max);
+            diag->SetLineStyle(2);
+            diag->SetLineColor(kGray + 2);
+            diag->SetLineWidth(2);
+            diag->Draw("SAME");
+
+            // Coordinate riscalate della misura reale (intersezione con la banda continua)
+            double meas_x = fit_BR * target_scale;
+            double limit_low = BR_low_c * target_scale;
+            double limit_up = BR_up_c * target_scale;
+
+            // 1. Linea verticale tratteggiata per la misura sperimentale X (fino al limite
+            // superiore)
+            TLine *l_meas_vert = new TLine(meas_x, plot_y_min, meas_x, limit_up);
+            l_meas_vert->SetLineStyle(2); // Tratteggio classico
+            l_meas_vert->SetLineColor(kBlack);
+            l_meas_vert->SetLineWidth(2);
+            l_meas_vert->Draw("SAME");
+
+            // 2. Linee orizzontali tratteggiate di proiezione verso l'asse Y
+            TLine *l_proj_up = new TLine(plot_x_min, limit_up, meas_x, limit_up);
+            l_proj_up->SetLineStyle(3); // Linea punteggiata
+            l_proj_up->SetLineColor(kRed);
+            l_proj_up->SetLineWidth(2);
+            l_proj_up->Draw("SAME");
+
+            TLine *l_proj_low = nullptr;
+            if(limit_low > 0.0)
+            {
+                l_proj_low = new TLine(plot_x_min, limit_low, meas_x, limit_low);
+                l_proj_low->SetLineStyle(3);
+                l_proj_low->SetLineColor(kRed);
+                l_proj_low->SetLineWidth(2);
+                l_proj_low->Draw("SAME");
+            }
+
+            // 3. Intervallo sblindato al 90% CL finale disegnato direttamente sull'asse Y (True B)
+            // Lo scostiamo leggermente a destra dell'asse Y (2% del range X) per non sovrapporlo
+            // alla linea dell'asse
+            double y_axis_offset = plot_x_min + 0.02 * (plot_x_max - plot_x_min);
+            TLine *l_err_y = new TLine(y_axis_offset, limit_low, y_axis_offset, limit_up);
+            l_err_y->SetLineColor(kRed);
+            l_err_y->SetLineWidth(4);
+            l_err_y->Draw("SAME");
+
+            // Trattini orizzontali di chiusura (Caps) sull'asse Y
+            double cap_w = 0.015 * (plot_x_max - plot_x_min);
+            TLine *l_cap_low
+                = new TLine(y_axis_offset - cap_w, limit_low, y_axis_offset + cap_w, limit_low);
+            TLine *l_cap_up
+                = new TLine(y_axis_offset - cap_w, limit_up, y_axis_offset + cap_w, limit_up);
+            l_cap_low->SetLineColor(kRed);
+            l_cap_low->SetLineWidth(3);
+            l_cap_up->SetLineColor(kRed);
+            l_cap_up->SetLineWidth(3);
+            l_cap_low->Draw("SAME");
+            l_cap_up->Draw("SAME");
+
+            // Legenda del plot di Feldman-Cousins (Font 43 a 24 pixel ereditato da stile)
+            TLegend *legFC = new TLegend(0.18, 0.68, 0.58, 0.86);
+            legFC->SetBorderSize(0);
+            legFC->SetFillStyle(0);
+            legFC->SetTextFont(43);
+            legFC->SetTextSize(24);
+            legFC->AddEntry(g_belt_scaled, "Feldman-Cousins Belt (90% CL)", "f");
+            legFC->AddEntry(l_err_y, "Unblinded Interval (90% CL)", "l");
+            legFC->AddEntry(l_meas_vert, "Point Estimate (#hat{B})", "l");
+            legFC->Draw("SAME");
+
+            gPad->RedrawAxis();
+            cFC_meas->Update();
+
+            if(savePlots)
+            {
+                SavePlot(cFC_meas, "./_fig/FeldmanCousins_FinalMeasurement", false);
+                cFC_meas->SaveAs("./_root/FeldmanCousins_FinalMeasurement.root");
+            }
+        }
+        fFC->Close();
+    }
+
+    // =========================================================================
+    // STEP 11: PULIZIA DELLA MEMORIA
+    // =========================================================================
+    // delete minH1;
+    // delete minH0;
+    // delete g_pdf_unbinned;
+
+    //    //g_pdf_unbinned = nullptr;
+    // g_data_hist = nullptr;
 }
